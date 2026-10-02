@@ -566,6 +566,58 @@ fn test_window_opened_after_app_activation_tiles_where_it_opened() {
     run_window_opened_after_display_moved(Command::PrintState, TEST_WORKSPACE_ID);
 }
 
+/// Closing the last window on the external display: macOS hands focus to
+/// another window of the same app (101) on the laptop, but the user was last
+/// on 100 there, so focus returns to 100.
+#[test]
+fn test_closing_last_window_on_display_focuses_the_other_displays_last_window() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 }, // 0
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToDisplay(Direction::North)),
+        }, // 1
+        Event::Command {
+            command: Command::PrintState,
+        }, // 2
+        Event::Command {
+            command: Command::PrintState,
+        }, // 3
+        Event::Command {
+            command: Command::PrintState,
+        }, // 4
+        Event::Command {
+            command: Command::PrintState,
+        }, // 5
+    ];
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let ext_origin = Origin::new(0, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT);
+    let ext_frame = IRect::from_corners(ext_origin, ext_origin + size);
+
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID])
+        .with_window(100, |data| data.pid = TEST_PROCESS_ID)
+        .with_window(101, |data| data.pid = TEST_PROCESS_ID)
+        .on_iteration(2, move |world, state| {
+            assert_eq!(state.active_display(), EXT_DISPLAY_ID);
+            state.set_focused_window(300);
+            let window = state.spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, 300, ext_frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(3, |world, state| {
+            assert_focused!(world, 300);
+            state.os_close_window(300);
+            state.set_focused_window(101);
+            state.set_active_display(TEST_DISPLAY_ID);
+            state.queue_event(Event::DisplayChanged);
+            state.queue_event(Event::WindowFocused { window_id: 101 });
+        })
+        .on_iteration(5, |world, _state| {
+            assert_focused!(world, 100);
+        })
+        .run(commands);
+}
+
 /// kitty opens a window through its single-instance server and then
 /// activates, which re-keys the window it had before. Here that old window is
 /// on the laptop and the new one on the external display, so following kitty's

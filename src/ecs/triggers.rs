@@ -16,8 +16,8 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, FloatingFrame, FocusedMarker, FreshMarker, LaunchedFrom,
-    MissionControlActive, OpenedFrom, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger,
-    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    MissionControlActive, OpenedFrom, PreviousManagedStrip, RetryFrontSwitch,
+    SelectedVirtualMarker, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -1524,7 +1524,11 @@ pub(super) fn refresh_configuration_trigger(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut workspaces: Query<(
+        &mut LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+    )>,
     windows: Windows,
     mut focus_history: ResMut<FocusHistory>,
     time: Res<Time>,
@@ -1536,9 +1540,10 @@ pub(super) fn window_removal_trigger(
     let had_focus = focused == Some(entity);
 
     let mut next = None;
-    if let Some((mut strip, _)) = workspaces
+    let mut emptied = None;
+    if let Some((mut strip, _, _)) = workspaces
         .iter_mut()
-        .find(|(strip, _)| strip.contains(entity))
+        .find(|(strip, _, _)| strip.contains(entity))
     {
         debug!(
             "Removing despawned entity {entity} from strip {}",
@@ -1567,11 +1572,14 @@ pub(super) fn window_removal_trigger(
         {
             next = Some(active);
         }
+        if had_focus && strip.len() == 0 {
+            emptied = Some(strip.id());
+        }
     } else if had_focus && let Some((_, _, Some(Unmanaged::Floating))) = windows.get_managed(entity)
     {
         next = workspaces
             .iter()
-            .find_map(|(strip, active)| {
+            .find_map(|(strip, active, _)| {
                 active.then(|| {
                     focus_history
                         .last_managed(strip.id())
@@ -1579,6 +1587,22 @@ pub(super) fn window_removal_trigger(
                 })
             })
             .flatten();
+    }
+
+    // The focused window was the last on its display. macOS hands focus to
+    // another window of the same app, wherever it is; go back to where the
+    // user last was on another display instead.
+    // ponytail: first display found, track display recency if 3+ displays.
+    if let Some(emptied) = emptied
+        && workspaces
+            .iter()
+            .all(|(strip, _, _)| strip.id() != emptied || strip.len() == 0)
+    {
+        next = workspaces.iter().find_map(|(strip, _, selected)| {
+            focus_history
+                .last_managed(strip.id())
+                .filter(|column| selected && strip.id() != emptied && strip.contains(*column))
+        });
     }
 
     if let Some(next) = next {
