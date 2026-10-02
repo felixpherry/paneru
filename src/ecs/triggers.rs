@@ -220,7 +220,7 @@ pub(super) fn theme_change_trigger(
 /// * `workspaces` - A query for the layout strips, to reorder the focused column.
 /// * `restore_guards` - Guards absorbing the OS acknowledgment of a restored focus.
 /// * `focus_history` - Per-workspace record of what was focused last.
-/// * `fresh` - Windows opened from the background that have not had focus yet.
+/// * `fresh` - New windows that have not had focus yet.
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `time` - When the focus moved, for the close hand-off's grace window.
 /// * `ctx` - Window queries, configuration and the command buffer.
@@ -273,13 +273,25 @@ pub(super) fn window_focused_trigger(
         // event: dropping it leaves the strip parked where it was, so Cmd-Tab
         // into a tabbed terminal looks like nothing happened.
         //
-        // A window its app opened from the background, and that has not had
-        // focus yet, is the exception. kitty opens one through its
-        // single-instance server and only then activates, which re-keys the
-        // window it had before, possibly on another display. Following that
-        // would hand focus back to the old window, so focus the new one.
+        // A new window that has not had focus yet is the exception when the
+        // app names a window in another strip. kitty opens one through its
+        // single-instance server and then activates, which re-keys the window
+        // it had before, on whatever display that is. Following it would carry
+        // the user away from the window they just opened, so focus that one.
+        let strip_of = |entity| {
+            workspaces
+                .iter()
+                .find_map(|(strip_entity, strip, _)| strip.contains(entity).then_some(strip_entity))
+        };
         let (window, entity, window_id) = match app.focused_window_id() {
-            Ok(current) if current != window_id && fresh.contains(entity) => {
+            Ok(current)
+                if current != window_id
+                    && fresh.contains(entity)
+                    && ctx
+                        .windows
+                        .find(current)
+                        .is_some_and(|(_, other)| strip_of(other) != strip_of(entity)) =>
+            {
                 debug!(
                     "app {} reports window {current} focused, but {window_id} just opened; focusing it",
                     app.name()
@@ -1356,6 +1368,14 @@ pub(super) fn apply_window_positions(
             {
                 focus_history.tiled_beside(strip.id(), entity, Some(anchor));
             }
+            // Opened where the user is, so it should take focus even while the
+            // app still reports its old window; see window_focused_trigger.
+            // Held until the window takes focus.
+            if !properties.dont_focus()
+                && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+            {
+                entity_commands.try_insert(FreshMarker);
+            }
         }
 
         // During init, skip per-window reshuffles. finish_setup does a single
@@ -1371,14 +1391,6 @@ pub(super) fn apply_window_positions(
                 }
             } else {
                 debug!("Synthesizing WindowFocused for newly spawned window {entity}");
-                // The app opened this window before activating, so the first
-                // focus report may still name its old window; see
-                // window_focused_trigger. Held until the window takes focus.
-                if !app.is_frontmost()
-                    && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
-                {
-                    entity_commands.try_insert(FreshMarker);
-                }
                 ctx.commands
                     .trigger(SendMessageTrigger(Event::WindowFocused {
                         window_id: window.id(),

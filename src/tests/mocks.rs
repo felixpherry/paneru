@@ -205,10 +205,9 @@ impl MockState {
             .push_back(Event::ApplicationFrontSwitched { psn });
     }
 
-    pub fn set_frontmost(&self, pid: Pid, frontmost: bool) {
-        if let Some(app) = self.inner.force_write().apps.get_mut(&pid) {
-            app.is_frontmost = frontmost;
-        }
+    /// Queues an OS event for the next drain, after any already queued.
+    pub fn queue_event(&self, event: Event) {
+        self.inner.force_write().event_queue.push_back(event);
     }
 
     pub fn focus_window(&self, id: WinID) {

@@ -205,43 +205,6 @@ fn test_dont_focus() {
         .run(commands);
 }
 
-/// kitty opens a window through its single-instance server and only then
-/// activates, which re-keys the window it had focused before. The app keeps
-/// reporting that old window, and following it pulled focus (and, with two
-/// displays, the active display) away from the window the user just opened.
-#[test]
-fn test_new_window_keeps_focus_when_app_activates_after_opening_it() {
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 }, // 0
-        Event::Command {
-            command: Command::PrintState,
-        }, // 1
-        Event::WindowFocused { window_id: 2 }, // 2
-        Event::Command {
-            command: Command::PrintState,
-        }, // 3
-    ];
-
-    TestHarness::new()
-        .with_windows(2)
-        .on_iteration(0, |world, state| {
-            state.set_focused_window(0);
-            state.set_frontmost(TEST_PROCESS_ID, false);
-            let origin = Origin::new(0, 0);
-            let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
-            let frame = IRect::from_corners(origin, origin + size);
-            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 2, frame);
-            world.trigger(SpawnWindowTrigger(vec![window]));
-        })
-        .on_iteration(1, |_world, state| {
-            state.set_frontmost(TEST_PROCESS_ID, true);
-        })
-        .on_iteration(3, |world, _state| {
-            assert_focused!(world, 2);
-        })
-        .run(commands);
-}
-
 #[test]
 fn test_focus_window_by_number() {
     assert!(parse_command(&["window", "focus", "0"]).is_err());

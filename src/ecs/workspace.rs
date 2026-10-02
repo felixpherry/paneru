@@ -127,7 +127,10 @@ impl Plugin for WorkspaceEventsPlugin {
                     .after(show_active_workspace)
                     .after(workspace_change_handler)
                     .after(workspace_created_handler),
-                workspace_change_handler,
+                // A front switch must see the strip the user was on before the
+                // display change its activation caused, when macOS reports
+                // both together (see OpenedFrom).
+                workspace_change_handler.after(super::triggers::front_switched_trigger),
                 workspace_created_handler,
                 show_active_workspace,
                 handle_virtual_window_moves,
