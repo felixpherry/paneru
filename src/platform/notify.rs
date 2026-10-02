@@ -51,7 +51,6 @@ impl NotifyHandler {
             KnownCGSEvent::SpaceCurrentChanged,
             KnownCGSEvent::SpaceDestroyed,
             KnownCGSEvent::SpaceWindowDestroyed,
-            KnownCGSEvent::SpaceWindowCreated,
         ];
         for event in events {
             unsafe {
@@ -109,7 +108,7 @@ impl NotifyHandler {
                 }
             }
 
-            KnownCGSEvent::SpaceWindowDestroyed | KnownCGSEvent::SpaceWindowCreated => {
+            KnownCGSEvent::SpaceWindowDestroyed => {
                 let offset = std::mem::size_of::<u64>();
                 if let Some(space) = from_bytes::<WorkspaceId>(data, len)
                     && let Some(window_id) = from_bytes::<WinID>(
@@ -118,10 +117,6 @@ impl NotifyHandler {
                     )
                 {
                     debug!("{event} space = {space}, window_id = {window_id}");
-                    // ponytail: logged only, to time it against AX discovery.
-                    if matches!(event, KnownCGSEvent::SpaceWindowCreated) {
-                        return;
-                    }
                     _ = self.events.send(Event::WindowDestroyed {
                         window_id,
                         source: DestroySource::SpaceNotification,
@@ -129,7 +124,8 @@ impl NotifyHandler {
                 }
             }
 
-            KnownCGSEvent::WindowClosed
+            KnownCGSEvent::SpaceWindowCreated
+            | KnownCGSEvent::WindowClosed
             | KnownCGSEvent::WindowMoved
             | KnownCGSEvent::WindowResized
             | KnownCGSEvent::WindowReordered
