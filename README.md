@@ -287,6 +287,7 @@ $ paneru send-cmd <command> [args...]
 | `window unstack`           | Unstack the focused window into its own column   |
 | `window nextdisplay`       | Move the focused window to the next display      |
 | `window nextdisplaysend`   | Move the window to the next display but stay here |
+| `window display <dir>`     | Move the window to the display in that direction and follow it |
 | `window virtual <dir>`     | Switch to the previous/next virtual workspace     |
 | `window virtualnum <n>`    | Switch directly to numbered virtual workspace    |
 | `window virtualmove <dir>` | Move the window to a different virtual workspace  |

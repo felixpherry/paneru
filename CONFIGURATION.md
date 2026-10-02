@@ -196,6 +196,7 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_balance` | Make all columns in the strip the same width as the focused window. |
 | `window_nextdisplay` | Move focused window to the next monitor and follow it. |
 | `window_nextdisplaysend` | Move focused window to the next monitor but stay on current. |
+| `window_display_north` / `_south` / `_west` / `_east` | Move the focused window, with its tab group, to the nearest monitor in that direction and follow it. It becomes a new column right of that monitor's active column. Does nothing for floating windows or when no monitor lies that way. |
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
 | `mouse_display_north` / `_south` / `_west` / `_east` | Focus the monitor in that direction from the focused one, wherever the mouse is. Focuses its most visible window and moves the mouse there; on a monitor with no windows, parks the mouse in its middle. |
 | `window_snap` | Snap an overflowing window into the viewport. |
