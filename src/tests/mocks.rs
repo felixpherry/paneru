@@ -191,6 +191,12 @@ impl MockState {
         }
     }
 
+    pub fn set_frontmost(&self, pid: Pid, frontmost: bool) {
+        if let Some(app) = self.inner.force_write().apps.get_mut(&pid) {
+            app.is_frontmost = frontmost;
+        }
+    }
+
     pub fn focus_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
         if let Some(win) = inner.windows.get(&id) {

@@ -202,6 +202,7 @@ pub(super) fn theme_change_trigger(
 /// * `workspaces` - A query for the layout strips, to reorder the focused column.
 /// * `restore_guards` - Guards absorbing the OS acknowledgment of a restored focus.
 /// * `focus_history` - Per-workspace record of what was focused last.
+/// * `fresh` - Windows opened from the background that have not had focus yet.
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `time` - When the focus moved, for the close hand-off's grace window.
 /// * `ctx` - Window queries, configuration and the command buffer.
@@ -213,6 +214,7 @@ pub(super) fn window_focused_trigger(
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     restore_guards: Query<(Entity, &RestoreFocusMarker)>,
     mut focus_history: ResMut<FocusHistory>,
+    fresh: Query<(), With<FreshMarker>>,
     global_state: GlobalState,
     time: Res<Time>,
     mut ctx: WindowCtx,
@@ -252,7 +254,21 @@ pub(super) fn window_focused_trigger(
         // decided to show. Follow it to that window rather than dropping the
         // event: dropping it leaves the strip parked where it was, so Cmd-Tab
         // into a tabbed terminal looks like nothing happened.
+        //
+        // A window its app opened from the background, and that has not had
+        // focus yet, is the exception. kitty opens one through its
+        // single-instance server and only then activates, which re-keys the
+        // window it had before, possibly on another display. Following that
+        // would hand focus back to the old window, so focus the new one.
         let (window, entity, window_id) = match app.focused_window_id() {
+            Ok(current) if current != window_id && fresh.contains(entity) => {
+                debug!(
+                    "app {} reports window {current} focused, but {window_id} just opened; focusing it",
+                    app.name()
+                );
+                ctx.commands.focus_entity(entity, true);
+                continue;
+            }
             Ok(current) if current != window_id => {
                 match ctx.windows.find_parent(current) {
                     Some((current_window, current_entity, current_parent))
@@ -271,6 +287,11 @@ pub(super) fn window_focused_trigger(
             }
             _ => (window, entity, window_id),
         };
+        if fresh.contains(entity)
+            && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<FreshMarker>();
+        }
 
         // Always keep passthrough in sync. An internal focus_entity call races
         // with the OS WindowFocused event; without this the passthrough keys
@@ -1320,6 +1341,14 @@ pub(super) fn apply_window_positions(
                 }
             } else {
                 debug!("Synthesizing WindowFocused for newly spawned window {entity}");
+                // The app opened this window before activating, so the first
+                // focus report may still name its old window; see
+                // window_focused_trigger. Held until the window takes focus.
+                if !app.is_frontmost()
+                    && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+                {
+                    entity_commands.try_insert(FreshMarker);
+                }
                 ctx.commands
                     .trigger(SendMessageTrigger(Event::WindowFocused {
                         window_id: window.id(),
