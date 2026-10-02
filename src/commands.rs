@@ -1120,7 +1120,7 @@ fn to_next_display(
         matches!(op, Operation::ToNextDisplay(_) | Operation::ToDisplay(_))
     })
     .find_map(|op| match op {
-        Operation::ToNextDisplay(move_focus) => Some((None, move_focus.clone())),
+        Operation::ToNextDisplay(move_focus) => Some((None, *move_focus)),
         Operation::ToDisplay(direction) => Some((Some(direction.clone()), MoveFocus::Follow)),
         _ => None,
     }) else {

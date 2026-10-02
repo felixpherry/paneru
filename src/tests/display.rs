@@ -1240,9 +1240,10 @@ fn test_display_move_keeps_width_ratio() {
                     .expect("display")
             };
             let (source, target) = (viewport(TEST_DISPLAY_ID), viewport(EXT_DISPLAY_ID));
-            let width = (f64::from(TEST_WINDOW_WIDTH) / f64::from(source.width())
-                * f64::from(target.width()))
-            .round() as i32;
+            let width = crate::util::round_px(
+                f64::from(TEST_WINDOW_WIDTH) / f64::from(source.width())
+                    * f64::from(target.width()),
+            );
             assert_window_size!(world, 100, width, target.height());
         })
         .run(commands);
