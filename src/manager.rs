@@ -38,9 +38,9 @@ pub use skylight::AXUIElementCopyAttributeValue;
 use skylight::{
     _AXUIElementCreateWithRemoteToken, SLSCopyActiveMenuBarDisplayIdentifier,
     SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
-    SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
-    SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
-    SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIsOrderedIn,
+    SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetConnectionPSN,
+    SLSGetCurrentCursorLocation, SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode,
+    SLSMainConnectionID, SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIsOrderedIn,
     SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID,
     SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
     SLSWindowQueryWindows,
@@ -134,6 +134,9 @@ pub trait WindowManagerApi: Send + Sync {
     /// * `window` - A reference to the `Window` to center the mouse on.
     /// * `display_bounds` - The `CGRect` representing the bounds of the display the window is on.
     fn warp_mouse(&self, origin: Origin);
+    /// Makes the desktop under `origin` the key window, so macOS activates
+    /// the display it is on even when that display has no windows.
+    fn focus_desktop(&self, origin: Origin);
     /// Adds existing windows for a given application, potentially resolving unresolved windows.
     ///
     /// # Arguments
@@ -206,6 +209,48 @@ pub struct WindowManagerOS {
 }
 
 impl WindowManagerOS {
+    /// The window at `point`, skipping Paneru's own, and the connection that owns it.
+    fn window_and_owner_at_point(&self, point: &CGPoint) -> Result<(WinID, ConnID)> {
+        let mut window_id: WinID = 0;
+        let mut window_conn_id: ConnID = 0;
+        let mut window_point = CGPoint { x: 0f64, y: 0f64 };
+        unsafe {
+            SLSFindWindowAndOwner(
+                self.main_cid,
+                0, // filter window id
+                1,
+                0,
+                point,
+                &mut window_point,
+                &mut window_id,
+                &mut window_conn_id,
+            )
+        }
+        .to_result(function_name!())?;
+        if self.main_cid == window_conn_id {
+            unsafe {
+                SLSFindWindowAndOwner(
+                    self.main_cid,
+                    window_id,
+                    -1,
+                    0,
+                    point,
+                    &mut window_point,
+                    &mut window_id,
+                    &mut window_conn_id,
+                )
+            }
+            .to_result(function_name!())?;
+        }
+        if window_id == 0 {
+            Err(Error::invalid_window(&format!(
+                "could not find a window at {point:?}",
+            )))
+        } else {
+            Ok((window_id, window_conn_id))
+        }
+    }
+
     /// Creates a new `WindowManagerOS` instance.
     /// It initializes the main connection ID to the macOS `SkyLight` API.
     ///
@@ -478,43 +523,23 @@ impl WindowManagerApi for WindowManagerOS {
     ///
     /// `Ok(WinID)` with the found window's ID if successful, otherwise `Err(Error)`.
     fn find_window_at_point(&self, point: &CGPoint) -> Result<WinID> {
-        let mut window_id: WinID = 0;
-        let mut window_conn_id: ConnID = 0;
-        let mut window_point = CGPoint { x: 0f64, y: 0f64 };
-        unsafe {
-            SLSFindWindowAndOwner(
-                self.main_cid,
-                0, // filter window id
-                1,
-                0,
-                point,
-                &mut window_point,
-                &mut window_id,
-                &mut window_conn_id,
-            )
-        }
-        .to_result(function_name!())?;
-        if self.main_cid == window_conn_id {
-            unsafe {
-                SLSFindWindowAndOwner(
-                    self.main_cid,
-                    window_id,
-                    -1,
-                    0,
-                    point,
-                    &mut window_point,
-                    &mut window_id,
-                    &mut window_conn_id,
-                )
-            }
-            .to_result(function_name!())?;
-        }
-        if window_id == 0 {
-            Err(Error::invalid_window(&format!(
-                "could not find a window at {point:?}",
-            )))
-        } else {
-            Ok(window_id)
+        self.window_and_owner_at_point(point)
+            .map(|(window_id, _)| window_id)
+    }
+
+    fn focus_desktop(&self, origin: Origin) {
+        let point = origin_to(origin);
+        let mut psn = ProcessSerialNumber::default();
+        let found = self
+            .window_and_owner_at_point(&point)
+            .and_then(|(window_id, owner)| {
+                unsafe { SLSGetConnectionPSN(owner, &mut psn) }
+                    .to_result(function_name!())
+                    .map(|()| window_id)
+            });
+        match found {
+            Ok(window_id) => windows::focus_process_window(psn, window_id),
+            Err(err) => warn!("can not focus the desktop at {origin:?}: {err}"),
         }
     }
 

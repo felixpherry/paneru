@@ -802,6 +802,21 @@ impl MockState {
         wm.expect_warp_mouse()
             .returning(move |origin| s.inner.force_write().cursor_position = origin);
 
+        // Like macOS, focusing the desktop activates the display it is on.
+        let s = self.clone();
+        wm.expect_focus_desktop().returning(move |origin| {
+            let mut inner = s.inner.force_write();
+            if let Some(id) = inner
+                .displays
+                .values()
+                .find(|display| display.bounds.contains(origin))
+                .map(|display| display.id)
+            {
+                inner.active_display_id = id;
+                inner.event_queue.push_back(Event::DisplayChanged);
+            }
+        });
+
         let s = self.clone();
         wm.expect_cursor_position()
             .returning(move || Some(origin_to(s.inner.force_read().cursor_position)));

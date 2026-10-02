@@ -1321,7 +1321,11 @@ fn mouse_to_next_display(
         })
     else {
         debug!("no suitable windows on the other display to move the mouse.");
-        window_manager.warp_mouse(other.bounds().center());
+        let center = other.bounds().center();
+        window_manager.warp_mouse(center);
+        // Moving the pointer alone leaves the menu bar, and with it where new
+        // windows open, on the old display.
+        window_manager.focus_desktop(center);
         return;
     };
 

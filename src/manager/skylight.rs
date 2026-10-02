@@ -393,6 +393,12 @@ unsafe extern "C" {
         psn_cid: &mut ConnID,
     ) -> CGError;
 
+    /// Retrieves the `ProcessSerialNumber` of the process owning a connection.
+    ///
+    /// # Original signature
+    /// extern `CGError` SLSGetConnectionPSN(int cid, `ProcessSerialNumber` *psn);
+    pub fn SLSGetConnectionPSN(cid: ConnID, psn: &mut ProcessSerialNumber) -> CGError;
+
     /// Sets the frontmost process with additional options and a target window ID.
     /// This function brings the specified process to the front and can optionally focus on a specific window within that process.
     ///

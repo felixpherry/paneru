@@ -6,7 +6,7 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::{DockPosition, Timeout};
+use crate::ecs::{ActiveDisplayMarker, DockPosition, Timeout};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WinID;
@@ -380,8 +380,7 @@ fn test_mouse_to_display_north_ignores_the_pointer() {
 }
 
 /// An empty display has no window to focus, so the pointer is parked in its
-/// middle. macOS does not make it the active display for that, so the way
-/// back starts from the display under the pointer.
+/// middle and its desktop is focused, which makes it the active display.
 #[test]
 fn test_mouse_to_empty_display_and_back() {
     let commands = vec![
@@ -401,8 +400,12 @@ fn test_mouse_to_empty_display_and_back() {
     TestHarness::new()
         .with_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID])
         .with_window(100, |data| data.pid = TEST_PROCESS_ID)
-        .on_iteration(1, move |_world, state| {
+        .on_iteration(1, move |world, state| {
             assert!(ext_bounds.contains(state.cursor_position()));
+            assert_eq!(state.active_display(), EXT_DISPLAY_ID);
+            let mut active = world.query_filtered::<&Display, With<ActiveDisplayMarker>>();
+            let active = active.single(world).expect("one active display");
+            assert_eq!(active.id(), EXT_DISPLAY_ID);
         })
         .on_iteration(3, move |world, state| {
             assert!(!ext_bounds.contains(state.cursor_position()));
