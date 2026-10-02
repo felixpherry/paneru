@@ -16,8 +16,8 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, FloatingFrame, FocusedMarker, FreshMarker, MissionControlActive,
-    PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme,
-    Timeout, Unmanaged,
+    OpenedFrom, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent,
+    SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -83,11 +83,16 @@ pub(crate) fn apply_config_side_effects(
 /// * `applications` - A query for all applications.
 /// * `focused_window` - A query for the focused window.
 /// * `focus_follows_mouse_id` - The resource to track focus follows mouse window ID.
+/// * `windows` - Known windows, to tell a window the app just opened.
+/// * `active_strip` - The strip the user is on when the app comes to the front.
 /// * `commands` - Bevy commands to trigger events and manage components.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn front_switched_trigger(
     mut messages: MessageReader<Event>,
     processes: Query<(&BProcess, &Children)>,
     applications: Query<&Application>,
+    windows: Windows,
+    active_strip: Query<Entity, With<ActiveWorkspaceMarker>>,
     window_manager: Res<WindowManager>,
     mut config: GlobalState,
     mut commands: Commands,
@@ -122,6 +127,19 @@ pub(super) fn front_switched_trigger(
         if let Ok(focused_id) = app.focused_window_id().inspect_err(|err| {
             warn!("can not get current focus: {err}");
         }) {
+            if let Ok(mut app_commands) = commands.get_entity(app_entity) {
+                match active_strip.single() {
+                    Ok(strip) if windows.find(focused_id).is_none() => {
+                        app_commands.try_insert(OpenedFrom {
+                            window_id: focused_id,
+                            strip,
+                        });
+                    }
+                    _ => {
+                        app_commands.try_remove::<OpenedFrom>();
+                    }
+                }
+            }
             if let Some(point) = window_manager.cursor_position()
                 && window_manager
                     .find_window_at_point(&point)
@@ -1235,11 +1253,11 @@ pub(super) fn apply_window_defaults(
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    apps: Query<&Application>,
+    mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    apps: Query<(&Application, Option<&OpenedFrom>)>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
@@ -1247,7 +1265,7 @@ pub(super) fn apply_window_positions(
     mut ctx: WindowCtx,
 ) {
     for entity in added {
-        if workspaces.iter().any(|(strip, _)| strip.tabbed(entity)) {
+        if workspaces.iter().any(|(_, strip, _)| strip.tabbed(entity)) {
             debug!("Ignoring tabbed {entity} attributes.");
             continue;
         }
@@ -1259,7 +1277,7 @@ pub(super) fn apply_window_positions(
         else {
             continue;
         };
-        let Ok(app) = apps.get(parent) else {
+        let Ok((app, opened_from)) = apps.get(parent) else {
             continue;
         };
 
@@ -1278,7 +1296,7 @@ pub(super) fn apply_window_positions(
         if properties.floating() {
             if let Some(mut strip) = workspaces
                 .iter_mut()
-                .find_map(|(strip, _)| strip.contains(entity).then_some(strip))
+                .find_map(|(_, strip, _)| strip.contains(entity).then_some(strip))
             {
                 strip.remove(entity);
             }
@@ -1289,15 +1307,27 @@ pub(super) fn apply_window_positions(
             continue;
         }
 
+        // A window its app came to the front with belongs where the user was
+        // then, not where the app put it.
+        let target = opened_from
+            .filter(|opened| opened.window_id == window.id())
+            .map(|opened| opened.strip)
+            .filter(|&strip| workspaces.contains(strip));
+
         // During startup, the window is already inserted into some strip by finish_setup.
         let allready_inserted = workspaces
             .iter_mut()
-            .find_map(|(strip, _)| strip.contains(entity).then_some(strip));
+            .find_map(|(_, strip, _)| strip.contains(entity).then_some(strip));
         if initializing.is_none()
             && allready_inserted.is_none()
-            && let Some(mut strip) = workspaces
-                .iter_mut()
-                .find_map(|(strip, active)| active.then_some(strip))
+            && let Some(mut strip) =
+                workspaces
+                    .iter_mut()
+                    .find_map(|(strip_entity, strip, active)| {
+                        target
+                            .map_or(active, |target| target == strip_entity)
+                            .then_some(strip)
+                    })
         {
             // Attempt inserting the window at a pre-defined position, otherwise
             // to the right of the currently focused window. niri remembers that

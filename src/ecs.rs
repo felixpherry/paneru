@@ -254,6 +254,16 @@ pub struct ActiveDisplayMarker;
 #[derive(Component)]
 pub struct FreshMarker;
 
+/// On an application: it came to the front with `window_id` focused before
+/// paneru knew that window, while `strip` was the active one. The app opened
+/// the window for the user, so it tiles into `strip` even when the app placed
+/// it on another display (Firefox's `--new-window` remote does).
+#[derive(Component)]
+pub struct OpenedFrom {
+    pub window_id: WinID,
+    pub strip: Entity,
+}
+
 /// Marker component used to gather existing processes and windows during initialization.
 #[derive(Component)]
 pub struct ExistingMarker;

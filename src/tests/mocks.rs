@@ -191,6 +191,20 @@ impl MockState {
         }
     }
 
+    /// Brings `pid` to the front reporting `window_id` as focused, before the
+    /// window is visible to paneru.
+    pub fn front_switch(&self, pid: Pid, window_id: WinID) {
+        let mut inner = self.inner.force_write();
+        let Some(app) = inner.apps.get_mut(&pid) else {
+            return;
+        };
+        app.focused_window_id = Some(window_id);
+        let psn = app.psn;
+        inner
+            .event_queue
+            .push_back(Event::ApplicationFrontSwitched { psn });
+    }
+
     pub fn set_frontmost(&self, pid: Pid, frontmost: bool) {
         if let Some(app) = self.inner.force_write().apps.get_mut(&pid) {
             app.is_frontmost = frontmost;

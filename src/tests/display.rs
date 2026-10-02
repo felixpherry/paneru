@@ -6,7 +6,7 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::{ActiveDisplayMarker, DockPosition, Timeout};
+use crate::ecs::{ActiveDisplayMarker, DockPosition, SpawnWindowTrigger, Timeout};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WinID;
@@ -410,6 +410,59 @@ fn test_mouse_to_empty_display_and_back() {
         .on_iteration(3, move |world, state| {
             assert!(!ext_bounds.contains(state.cursor_position()));
             assert_focused!(world, 100);
+        })
+        .run(commands);
+}
+
+/// Firefox's `--new-window` remote brings Firefox to the front with the new
+/// window already focused, but places that window next to its others on the
+/// laptop. macOS follows it there before paneru sees the window, which then
+/// tiled into the laptop strip although the user was on the external display.
+#[test]
+fn test_window_opened_from_background_tiles_on_the_display_the_user_was_on() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 }, // 0
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToDisplay(Direction::North)),
+        }, // 1
+        Event::Command {
+            command: Command::PrintState,
+        }, // 2
+        Event::Command {
+            command: Command::PrintState,
+        }, // 3
+        Event::DisplayChanged,                // 4
+        Event::Command {
+            command: Command::PrintState,
+        }, // 5
+        Event::Command {
+            command: Command::PrintState,
+        }, // 6
+    ];
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let frame = IRect::from_corners(Origin::new(0, 0), Origin::new(0, 0) + size);
+
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID])
+        .with_window(100, |data| data.pid = TEST_PROCESS_ID)
+        .on_iteration(2, |_world, state| {
+            assert_eq!(state.active_display(), EXT_DISPLAY_ID);
+            // The app comes to the front with a window paneru can't see yet...
+            state.front_switch(TEST_PROCESS_ID, 300);
+        })
+        .on_iteration(3, move |_world, state| {
+            // ...which sits on the laptop, so macOS activates the laptop.
+            state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 300, frame);
+            state.set_active_display(TEST_DISPLAY_ID);
+        })
+        .on_iteration(4, |world, state| {
+            let window = state.create_window(300);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(6, |world, _state| {
+            assert_on_workspace!(world, 300, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 300, TEST_WORKSPACE_ID);
         })
         .run(commands);
 }
