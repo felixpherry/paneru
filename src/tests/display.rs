@@ -1040,3 +1040,210 @@ fn test_empty_baseline_row_survives_display_removal() {
         })
         .run(commands);
 }
+
+/// The window ids of each column of the strip for `workspace_id`, top window
+/// of each column.
+fn strip_columns(world: &mut World, workspace_id: u64) -> Vec<WinID> {
+    let columns = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .find(|strip| strip.id() == workspace_id)
+        .expect("strip should exist")
+        .all_columns();
+    columns
+        .into_iter()
+        .map(|entity| world.get::<Window>(entity).expect("window").id())
+        .collect()
+}
+
+/// The laptop with the Dell above it and window 100 on the laptop, plus
+/// `ext_windows` on the Dell.
+fn harness_with_display_above(ext_windows: &[WinID]) -> TestHarness {
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let ext_origin = Origin::new(0, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT);
+    let ext_frame = IRect::from_corners(ext_origin, ext_origin + size);
+    ext_windows.iter().fold(
+        TestHarness::new()
+            .with_display(
+                EXT_DISPLAY_ID,
+                IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+                vec![EXT_WORKSPACE_ID],
+            )
+            .with_window(100, |data| data.pid = TEST_PROCESS_ID),
+        |harness, id| {
+            harness.with_workspace_window(*id, EXT_WORKSPACE_ID, |data| data.frame = ext_frame)
+        },
+    )
+}
+
+fn to_display(direction: Direction) -> Event {
+    Event::Command {
+        command: Command::Window(Operation::ToDisplay(direction)),
+    }
+}
+
+#[test]
+fn test_display_north_moves_window_up() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        to_display(Direction::North),
+    ];
+
+    harness_with_display_above(&[])
+        .on_iteration(1, |world, _state| {
+            assert_on_workspace!(world, 100, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 100, TEST_WORKSPACE_ID);
+            assert_focused!(world, 100);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_display_south_without_display_below_is_noop() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        to_display(Direction::South),
+    ];
+
+    harness_with_display_above(&[])
+        .with_window(101, |data| data.pid = TEST_PROCESS_ID)
+        .on_iteration(0, |world, _state| {
+            assert_eq!(strip_columns(world, TEST_WORKSPACE_ID), vec![100, 101]);
+        })
+        .on_iteration(1, |world, _state| {
+            assert_eq!(strip_columns(world, TEST_WORKSPACE_ID), vec![100, 101]);
+            assert_eq!(strip_columns(world, EXT_WORKSPACE_ID), Vec::<WinID>::new());
+            assert_focused!(world, 100);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_display_move_lands_right_of_active_column() {
+    let print = || Event::Command {
+        command: Command::PrintState,
+    };
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        print(),
+        print(),
+        to_display(Direction::North),
+    ];
+
+    // Visit 201 on the Dell so it becomes that row's active column, then
+    // come back to the laptop.
+    harness_with_display_above(&[200, 201, 202])
+        .on_iteration(0, |_world, state| state.focus_window(201))
+        .on_iteration(1, |_world, state| state.focus_window(100))
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 100);
+            assert_eq!(strip_columns(world, EXT_WORKSPACE_ID), vec![200, 201, 202]);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_eq!(
+                strip_columns(world, EXT_WORKSPACE_ID),
+                vec![200, 201, 100, 202]
+            );
+            assert_focused!(world, 100);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_display_move_into_empty_row() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        to_display(Direction::North),
+    ];
+
+    harness_with_display_above(&[])
+        .with_window(101, |data| data.pid = TEST_PROCESS_ID)
+        .on_iteration(1, |world, _state| {
+            assert_eq!(strip_columns(world, EXT_WORKSPACE_ID), vec![100]);
+            assert_eq!(strip_columns(world, TEST_WORKSPACE_ID), vec![101]);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_display_move_takes_tab_group() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        to_display(Direction::North),
+    ];
+
+    harness_with_display_above(&[])
+        .on_iteration(0, |world, state| {
+            super::tabs::spawn_matching_native_tab(world, &state, 100);
+        })
+        .on_iteration(1, |world, _state| {
+            assert_eq!(strip_columns(world, TEST_WORKSPACE_ID).len(), 1);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_eq!(strip_columns(world, TEST_WORKSPACE_ID), Vec::<WinID>::new());
+            assert_eq!(strip_columns(world, EXT_WORKSPACE_ID).len(), 1);
+            let (leader, follower) = (
+                find_window_entity(100, world),
+                find_window_entity(101, world),
+            );
+            let strip = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .find(|strip| strip.id() == EXT_WORKSPACE_ID)
+                .expect("strip should exist");
+            assert!(strip.tabbed(leader) && strip.tabbed(follower));
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_display_move_ignores_floating() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        },
+        to_display(Direction::North),
+    ];
+
+    harness_with_display_above(&[])
+        .with_window(101, |data| data.pid = TEST_PROCESS_ID)
+        .on_iteration(2, |world, _state| {
+            assert_eq!(strip_columns(world, EXT_WORKSPACE_ID), Vec::<WinID>::new());
+            assert_eq!(strip_columns(world, TEST_WORKSPACE_ID), vec![101]);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_display_move_keeps_width_ratio() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        to_display(Direction::North),
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    harness_with_display_above(&[])
+        .on_iteration(2, |world, _state| {
+            let config = world.resource::<Config>().clone();
+            let mut viewports = world.query::<(&Display, Option<&DockPosition>)>();
+            let mut viewport = |id| {
+                viewports
+                    .iter(world)
+                    .find(|(display, _)| display.id() == id)
+                    .map(|(display, dock)| display.actual_display_bounds(dock, &config))
+                    .expect("display")
+            };
+            let (source, target) = (viewport(TEST_DISPLAY_ID), viewport(EXT_DISPLAY_ID));
+            let width = (f64::from(TEST_WINDOW_WIDTH) / f64::from(source.width())
+                * f64::from(target.width()))
+            .round() as i32;
+            assert_window_size!(world, 100, width, target.height());
+        })
+        .run(commands);
+}

@@ -10,7 +10,7 @@ use crate::platform::WinID;
 
 use super::*;
 
-fn spawn_matching_native_tab(world: &mut World, state: &MockState, window_id: WinID) {
+pub(crate) fn spawn_matching_native_tab(world: &mut World, state: &MockState, window_id: WinID) {
     let leader = find_window_entity(window_id, world);
     let frame = world
         .get::<Window>(leader)
