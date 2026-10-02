@@ -234,6 +234,9 @@ pub enum Operation {
     FullWidth,
     /// Moves the focused window to the next available display.
     ToNextDisplay(MoveFocus),
+    /// Moves the focused window to the nearest display in that direction and
+    /// follows it.
+    ToDisplay(Direction),
     /// Distributes heights equally among windows in the focused stack.
     Equalize,
     /// Makes all columns in the active strip the same width as the focused window.
