@@ -212,6 +212,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         Update,
         (
             triggers::front_switched_trigger,
+            triggers::launched_from_trigger,
             triggers::window_focused_trigger,
             triggers::mission_control_trigger,
             triggers::application_event_trigger,
@@ -262,6 +263,16 @@ pub struct FreshMarker;
 pub struct OpenedFrom {
     pub window_id: WinID,
     pub strip: Entity,
+}
+
+/// The strip the user was on when they last pressed a Lua binding, and when.
+/// A binding usually launches something, and the app it starts may pull macOS
+/// onto another display before its window appears (Firefox's `--new-window`
+/// does), so the next window to spawn soon after tiles into this strip.
+#[derive(Resource)]
+pub struct LaunchedFrom {
+    pub strip: Entity,
+    pub at: Duration,
 }
 
 /// Marker component used to gather existing processes and windows during initialization.

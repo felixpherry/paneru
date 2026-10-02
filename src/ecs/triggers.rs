@@ -15,9 +15,9 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, FloatingFrame, FocusedMarker, FreshMarker, MissionControlActive,
-    OpenedFrom, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent,
-    SystemTheme, Timeout, Unmanaged,
+    ActiveDisplayMarker, BProcess, FloatingFrame, FocusedMarker, FreshMarker, LaunchedFrom,
+    MissionControlActive, OpenedFrom, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger,
+    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -166,6 +166,30 @@ pub(super) fn front_switched_trigger(
             );
             commands.spawn((timeout, RetryFrontSwitch(app_entity)));
         }
+    }
+}
+
+/// Records where the user was when they pressed a Lua binding; see
+/// [`LaunchedFrom`].
+pub(super) fn launched_from_trigger(
+    mut messages: MessageReader<Event>,
+    active_strip: Query<Entity, With<ActiveWorkspaceMarker>>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    let pressed = messages.read().any(|event| {
+        matches!(
+            event,
+            Event::Command {
+                command: crate::commands::Command::Lua(_)
+            }
+        )
+    });
+    if pressed && let Ok(strip) = active_strip.single() {
+        commands.insert_resource(LaunchedFrom {
+            strip,
+            at: time.elapsed(),
+        });
     }
 }
 
@@ -1270,12 +1294,22 @@ pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     apps: Query<(&Application, Option<&OpenedFrom>)>,
+    launched: Option<Res<LaunchedFrom>>,
+    time: Res<Time>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
     mut focus_history: ResMut<FocusHistory>,
     mut ctx: WindowCtx,
 ) {
+    // ponytail: any app's window counts, since a launcher's pid isn't the app's
+    // (firefox --new-window hands off to the running Firefox). Long enough for
+    // a running app to open a window, not for a cold start.
+    const LAUNCH_WINDOW: Duration = Duration::from_secs(3);
+    let mut launched = launched
+        .filter(|launched| time.elapsed().saturating_sub(launched.at) < LAUNCH_WINDOW)
+        .map(|launched| launched.strip);
+
     for entity in added {
         if workspaces.iter().any(|(_, strip, _)| strip.tabbed(entity)) {
             debug!("Ignoring tabbed {entity} attributes.");
@@ -1319,11 +1353,16 @@ pub(super) fn apply_window_positions(
             continue;
         }
 
-        // A window its app came to the front with belongs where the user was
-        // then, not where the app put it.
+        // A window the user launched, or its app came to the front with,
+        // belongs where the user was then, not where the app put it.
+        let launched_strip = launched.take();
+        if launched_strip.is_some() {
+            ctx.commands.remove_resource::<LaunchedFrom>();
+        }
         let target = opened_from
             .filter(|opened| opened.window_id == window.id())
             .map(|opened| opened.strip)
+            .or(launched_strip)
             .filter(|&strip| workspaces.contains(strip));
 
         // During startup, the window is already inserted into some strip by finish_setup.

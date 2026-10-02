@@ -509,6 +509,63 @@ fn test_window_opened_from_background_survives_display_change_reported_first() {
         .run(commands);
 }
 
+/// Firefox's `--new-window`, started from a binding while the user is on the
+/// external display: Firefox comes to the front naming one of its old laptop
+/// windows, macOS activates the laptop, and the new window spawns there.
+/// `press` is the command the user's key sent before all that.
+fn run_window_opened_after_display_moved(press: Command, workspace: WorkspaceId) {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 }, // 0
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToDisplay(Direction::North)),
+        }, // 1
+        Event::Command { command: press },    // 2
+        Event::Command {
+            command: Command::PrintState,
+        }, // 3
+        Event::Command {
+            command: Command::PrintState,
+        }, // 4
+        Event::Command {
+            command: Command::PrintState,
+        }, // 5
+    ];
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let frame = IRect::from_corners(Origin::new(0, 0), Origin::new(0, 0) + size);
+
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID])
+        .with_window(100, |data| data.pid = TEST_PROCESS_ID)
+        .on_iteration(2, |_world, state| {
+            assert_eq!(state.active_display(), EXT_DISPLAY_ID);
+            state.set_active_display(TEST_DISPLAY_ID);
+            state.queue_event(Event::DisplayChanged);
+            state.queue_event(Event::SpaceChanged);
+            state.front_switch(TEST_PROCESS_ID, 100);
+        })
+        .on_iteration(4, move |world, state| {
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 300, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(5, move |world, _state| {
+            assert_on_workspace!(world, 300, workspace);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_window_launched_from_binding_tiles_where_the_binding_was_pressed() {
+    run_window_opened_after_display_moved(Command::Lua(1), EXT_WORKSPACE_ID);
+}
+
+/// Without a binding press this is a Cmd-Tab to the app on the laptop, so a
+/// window it opens belongs on the laptop.
+#[test]
+fn test_window_opened_after_app_activation_tiles_where_it_opened() {
+    run_window_opened_after_display_moved(Command::PrintState, TEST_WORKSPACE_ID);
+}
+
 /// kitty opens a window through its single-instance server and then
 /// activates, which re-keys the window it had before. Here that old window is
 /// on the laptop and the new one on the external display, so following kitty's
