@@ -368,19 +368,14 @@ fn command_move_focus(
         return;
     }
 
-    // Check if the movement can switch to another display.
-    let Some(other_display) = active_display.other().next() else {
-        return;
-    };
-    let change_display = match direction {
-        Direction::North => active_display.bounds().min.y > other_display.bounds().min.y,
-        Direction::South => active_display.bounds().min.y < other_display.bounds().min.y,
-        _ => false,
-    };
-    debug!("moving focus to another display: {change_display}");
-    if change_display {
+    // Nothing further that way on this display: try the one beyond it.
+    if matches!(direction, Direction::North | Direction::South)
+        && active_display.other().any(|other| {
+            distance_toward(active_display.bounds(), other.bounds(), direction).is_some()
+        })
+    {
         commands.trigger(SendMessageTrigger(Event::Command {
-            command: Command::Mouse(MouseMove::ToNextDisplay),
+            command: Command::Mouse(MouseMove::ToDisplay(direction.clone())),
         }));
     }
 }
@@ -1229,34 +1224,78 @@ fn to_next_display(
     }
 }
 
-/// Moves the mouse pointer to the next available display.
+/// How far `to` lies from `from` in `direction`, centre to centre, or `None`
+/// when it is not that way at all.
+fn distance_toward(from: IRect, to: IRect, direction: &Direction) -> Option<i32> {
+    let delta = to.center() - from.center();
+    let distance = match direction {
+        Direction::North => -delta.y,
+        Direction::South => delta.y,
+        Direction::West => -delta.x,
+        Direction::East => delta.x,
+        Direction::First | Direction::Last | Direction::Nth(_) => return None,
+    };
+    (distance > 0).then_some(distance)
+}
+
+/// Moves the mouse pointer to another display and focuses its most visible
+/// window: the display the pointer is not on for `ToNextDisplay`, or the
+/// nearest one in a direction for `ToDisplay`.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn mouse_to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
     layout_strips: Query<(&LayoutStrip, Entity)>,
-    displays: Query<&Display>,
+    displays: Query<(&Display, Has<ActiveDisplayMarker>)>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
-    if !messages.read().any(|event| {
-        matches!(
-            event,
-            Event::Command {
-                command: Command::Mouse(MouseMove::ToNextDisplay),
-            }
-        )
-    }) {
-        return;
-    }
-
-    let Some(cursor_position) = window_manager.cursor_position().map(origin_from) else {
+    let Some(target) = messages.read().find_map(|event| match event {
+        Event::Command {
+            command: Command::Mouse(target),
+        } => Some(target.clone()),
+        _ => None,
+    }) else {
         return;
     };
-    let Some(other) = displays
-        .into_iter()
-        .find(|display| !display.bounds().contains(cursor_position))
-    else {
+
+    let cursor_position = window_manager.cursor_position().map(origin_from);
+    let other = match &target {
+        MouseMove::ToNextDisplay => cursor_position.and_then(|cursor| {
+            displays
+                .iter()
+                .map(|(display, _)| display)
+                .find(|display| !display.bounds().contains(cursor))
+        }),
+        MouseMove::ToDisplay(direction) => {
+            let toward = |from: IRect| {
+                displays
+                    .iter()
+                    .filter_map(|(display, _)| {
+                        distance_toward(from, display.bounds(), direction).zip(Some(display))
+                    })
+                    .min_by_key(|(distance, _)| *distance)
+                    .map(|(_, display)| display)
+            };
+            // The active display is where focus is, but parking the pointer on
+            // a display with no windows need not make macOS activate it.
+            // Falling back to the display under the pointer lets the opposite
+            // direction leave such a display again.
+            let active = displays
+                .iter()
+                .find_map(|(display, active)| active.then(|| display.bounds()));
+            let under_cursor = cursor_position.and_then(|cursor| {
+                displays
+                    .iter()
+                    .map(|(display, _)| display.bounds())
+                    .find(|bounds| bounds.contains(cursor))
+            });
+            active
+                .and_then(toward)
+                .or_else(|| under_cursor.and_then(toward))
+        }
+    };
+    let Some(other) = other else {
         debug!("no other display to move mouse to.");
         return;
     };

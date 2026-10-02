@@ -295,6 +295,7 @@ $ paneru send-cmd <command> [args...]
 | `window virtualsendnum <n>` | Send the window to numbered virtual workspace but stay |
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
+| `mouse display <dir>`      | Focus the display in that direction, wherever the pointer is |
 | `overview`                 | Toggle the overview of all virtual workspaces    |
 | `printstate`               | Print the internal ECS state to the debug log    |
 | `quit`                     | Quit Paneru                                      |

@@ -287,6 +287,10 @@ pub enum Operation {
 pub enum MouseMove {
     /// Moves the mouse pointer to the next available display.
     ToNextDisplay,
+    /// Moves the mouse pointer and focus to the display in that direction from
+    /// the active one, or from the one under the pointer if the active one has
+    /// nothing that way.
+    ToDisplay(Direction),
 }
 
 /// Represents a command that can be issued to the window manager.

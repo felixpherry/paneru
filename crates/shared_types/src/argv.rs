@@ -146,6 +146,9 @@ fn virtual_target(
 fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
     match *argv.first().unwrap_or(&"") {
         "nextdisplay" => Ok(MouseMove::ToNextDisplay),
+        "display" => Ok(MouseMove::ToDisplay(Direction::parse(
+            argv.get(1).copied().unwrap_or_default(),
+        )?)),
         _ => Err(ParseError::new(format!("invalid mouse command '{argv:?}'"))),
     }
 }
@@ -165,6 +168,13 @@ impl Command {
             }
             Command::Mouse(MouseMove::ToNextDisplay) => {
                 vec!["mouse".to_string(), "nextdisplay".to_string()]
+            }
+            Command::Mouse(MouseMove::ToDisplay(direction)) => {
+                vec![
+                    "mouse".to_string(),
+                    "display".to_string(),
+                    direction.token(),
+                ]
             }
             Command::Quit => vec!["quit".to_string()],
             Command::Restart => vec!["restart".to_string()],
@@ -293,6 +303,7 @@ mod tests {
             Command::PrintState,
             Command::Overview,
             Command::Mouse(MouseMove::ToNextDisplay),
+            Command::Mouse(MouseMove::ToDisplay(Direction::North)),
         ] {
             assert_eq!(
                 format!("{:?}", round_trip(&command)),

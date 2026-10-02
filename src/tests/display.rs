@@ -10,7 +10,10 @@ use crate::ecs::{DockPosition, Timeout};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WinID;
-use crate::{assert_not_on_workspace, assert_on_workspace, assert_window_at, assert_window_size};
+use crate::{
+    assert_focused, assert_not_on_workspace, assert_on_workspace, assert_window_at,
+    assert_window_size,
+};
 
 use super::*;
 
@@ -334,6 +337,76 @@ fn test_mouse_to_next_display() {
             let config = world.resource::<Config>();
             let bounds = display.actual_display_bounds(dock, config);
             assert_eq!(state.cursor_position(), bounds.center());
+        })
+        .run(commands);
+}
+
+/// `mouse display north` goes by where focus is, not by the pointer: with
+/// the pointer already resting on the display above, it still moves focus up
+/// there (`mouse nextdisplay` would pick the display without the pointer, the
+/// one focus is already on).
+#[test]
+fn test_mouse_to_display_north_ignores_the_pointer() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToDisplay(Direction::North)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let ext_origin = Origin::new(0, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT);
+    let ext_frame = IRect::from_corners(ext_origin, ext_origin + size);
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID])
+        .with_window(100, |data| data.pid = TEST_PROCESS_ID)
+        .with_workspace_window(200, EXT_WORKSPACE_ID, |data| data.frame = ext_frame)
+        .on_iteration(1, move |world, state| {
+            assert_focused!(world, 100);
+            state.set_cursor_position(ext_bounds.center());
+        })
+        .on_iteration(3, move |world, state| {
+            assert_focused!(world, 200);
+            assert!(ext_bounds.contains(state.cursor_position()));
+        })
+        .run(commands);
+}
+
+/// An empty display has no window to focus, so the pointer is parked in its
+/// middle. macOS does not make it the active display for that, so the way
+/// back starts from the display under the pointer.
+#[test]
+fn test_mouse_to_empty_display_and_back() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToDisplay(Direction::North)),
+        },
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToDisplay(Direction::South)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID])
+        .with_window(100, |data| data.pid = TEST_PROCESS_ID)
+        .on_iteration(1, move |_world, state| {
+            assert!(ext_bounds.contains(state.cursor_position()));
+        })
+        .on_iteration(3, move |world, state| {
+            assert!(!ext_bounds.contains(state.cursor_position()));
+            assert_focused!(world, 100);
         })
         .run(commands);
 }

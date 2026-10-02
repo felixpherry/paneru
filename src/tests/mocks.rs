@@ -418,6 +418,10 @@ impl MockState {
         self.inner.force_read().cursor_position
     }
 
+    pub fn set_cursor_position(&self, origin: Origin) {
+        self.inner.force_write().cursor_position = origin;
+    }
+
     // --- Mock Factory Methods ---
 
     #[allow(clippy::too_many_lines)]
