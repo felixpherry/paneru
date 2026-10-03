@@ -98,6 +98,75 @@ fn native_fullscreen_transition_removes_window_from_original_strip_without_focus
         ]);
 }
 
+/// A virtual switch on a fullscreen space must not add a row there, and when
+/// the space goes away every row on it goes too, the fullscreen window
+/// returning home even when it isn't the first row found.
+#[test]
+fn native_fullscreen_exit_restores_window_with_extra_row_on_space() {
+    const FULLSCREEN_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
+    let config: Config = (
+        MainOptions {
+            dynamic_workspaces: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let fullscreen_rows = |world: &mut World| {
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .filter(|strip| strip.id() == FULLSCREEN_WORKSPACE_ID)
+            .count()
+    };
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(0, |world, state| {
+            let focused = world
+                .query_filtered::<Entity, With<FocusedMarker>>()
+                .iter(world)
+                .collect::<Vec<_>>();
+            for entity in focused {
+                world.entity_mut(entity).remove::<FocusedMarker>();
+            }
+            state.update_window(0, |window| {
+                window.workspace_id = FULLSCREEN_WORKSPACE_ID;
+                window.is_full_screen = true;
+            });
+            state.activate_workspace(TEST_DISPLAY_ID, FULLSCREEN_WORKSPACE_ID, true);
+        })
+        .on_iteration(2, move |world, _state| {
+            assert_eq!(fullscreen_rows(world), 1);
+            // Rows a build without the guard left behind on a fullscreen space.
+            world.spawn(LayoutStrip::new(FULLSCREEN_WORKSPACE_ID, 1));
+            world.spawn(LayoutStrip::new(FULLSCREEN_WORKSPACE_ID, 2));
+        })
+        .on_iteration(3, move |world, _state| {
+            let fullscreen_window = find_window_entity(0, world);
+            assert_eq!(fullscreen_rows(world), 0);
+            let original_strip = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .find(|strip| strip.id() == TEST_WORKSPACE_ID && strip.virtual_index == 0)
+                .expect("original strip");
+            assert_eq!(original_strip.index_of(fullscreen_window).ok(), Some(0));
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+            Event::Command {
+                command: Command::Window(Operation::Virtual(Direction::South)),
+            },
+            Event::SpaceDestroyed {
+                space_id: FULLSCREEN_WORKSPACE_ID,
+            },
+        ]);
+}
+
 #[test]
 fn frontmost_floating_window_is_focused_after_setup() {
     let mut params = WindowParams::new(".*", None);

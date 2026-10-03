@@ -440,46 +440,50 @@ fn workspace_destroyed_handler(
         };
         focus_history.forget_workspace(*space_id);
 
-        let Some((entity, fullscreen)) =
-            workspaces.iter().find_map(|(strip, entity, fullscreen)| {
+        // A space can hold several rows, and the fullscreen one need not be
+        // the first. Skipping it strands its window on a dead space.
+        let doomed = workspaces
+            .iter()
+            .filter(|(strip, _, _)| strip.id() == *space_id)
+            .map(|(strip, entity, fullscreen)| {
                 let window = strip.first().ok().and_then(|col| col.top());
-                (strip.id() == *space_id).then_some((entity, window.zip(fullscreen.cloned())))
+                (entity, window.zip(fullscreen.cloned()))
             })
-        else {
-            continue;
-        };
+            .collect::<Vec<_>>();
 
-        if let Some((
-            window,
-            NativeFullscreenMarker {
-                layout_strip,
-                workspace_id,
-                index,
-            },
-        )) = fullscreen
-        {
-            let mut strip = workspaces
-                .iter_mut()
-                .find_map(|(strip, entity, _)| (entity == layout_strip).then_some(strip));
-            if strip.is_none() {
-                strip = workspaces
+        for (entity, fullscreen) in doomed {
+            if let Some((
+                window,
+                NativeFullscreenMarker {
+                    layout_strip,
+                    workspace_id,
+                    index,
+                },
+            )) = fullscreen
+            {
+                let mut strip = workspaces
                     .iter_mut()
-                    .find_map(|(strip, _, _)| (strip.id() == workspace_id).then_some(strip));
+                    .find_map(|(strip, entity, _)| (entity == layout_strip).then_some(strip));
+                if strip.is_none() {
+                    strip = workspaces
+                        .iter_mut()
+                        .find_map(|(strip, _, _)| (strip.id() == workspace_id).then_some(strip));
+                }
+
+                debug!(
+                    "previously fullscreened window {entity} inserted at {}",
+                    index
+                );
+                if let Some(mut strip) = strip {
+                    strip.insert_at(index, window);
+                    commands.reshuffle_around(window);
+                }
             }
 
-            debug!(
-                "previously fullscreened window {entity} inserted at {}",
-                index
-            );
-            if let Some(mut strip) = strip {
-                strip.insert_at(index, window);
-                commands.reshuffle_around(window);
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                debug!("Workspace destroyed {space_id} {entity}");
+                entity_commands.try_despawn();
             }
-        }
-
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            debug!("Workspace destroyed {space_id} {entity}");
-            entity_commands.try_despawn();
         }
     }
 }
@@ -973,6 +977,10 @@ fn switch_virtual_workspace_bind(
         operation => operation,
     };
 
+    // A native fullscreen space holds its one window and nothing else.
+    if active_display.active_strip().is_fullscreen() {
+        return;
+    }
     let workspace_id = active_display.active_strip().id();
     let mut rows = workspaces
         .iter()
@@ -1137,6 +1145,9 @@ fn move_virtual_workspace_bind(
     let Some((_, focused_entity)) = windows.focused() else {
         return;
     };
+    if active_display.active_strip().is_fullscreen() {
+        return;
+    }
 
     let mut rows = workspaces
         .iter()
