@@ -152,10 +152,22 @@ impl<'a> RestorePlanner<'a> {
         }
     }
 
-    pub(crate) fn plan(&self, current: &[CurrentWindowIdentity]) -> RestorePlan {
+    /// Plans only the saved workspaces in `live_spaces`. A space macOS has
+    /// since dropped (a closed fullscreen space, say) would otherwise come
+    /// back as a row nothing can show, taking its windows with it.
+    pub(crate) fn plan(
+        &self,
+        current: &[CurrentWindowIdentity],
+        live_spaces: &HashSet<WorkspaceId>,
+    ) -> RestorePlan {
         let mut plan = RestorePlan::default();
 
-        for workspace in &self.state.workspaces {
+        for workspace in self
+            .state
+            .workspaces
+            .iter()
+            .filter(|workspace| live_spaces.contains(&workspace.workspace_id))
+        {
             let surviving_strips = self.plan_workspace(workspace, current, &mut plan);
             Self::record_active_virtual(workspace, &surviving_strips, &mut plan);
             plan.strips.extend(surviving_strips);
@@ -433,7 +445,12 @@ pub(super) fn restore_window_state(
     };
 
     let current = current_window_identities(&ctx.windows, &apps, restoration);
-    let plan = RestorePlanner::new(restoration).plan(&current);
+    // Startup spawns a row for every space macOS reports, before this runs.
+    let live_spaces = workspaces
+        .iter()
+        .map(|(_, strip, _, _)| strip.id())
+        .collect::<HashSet<_>>();
+    let plan = RestorePlanner::new(restoration).plan(&current, &live_spaces);
 
     if plan.consumed_entities.is_empty() {
         info!(

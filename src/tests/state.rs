@@ -12,7 +12,7 @@ use crate::ecs::state::{
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker};
 use crate::events::Event;
 use crate::manager::{Application, Display, WindowManager};
-use crate::platform::{Pid, ProcessSerialNumber, WinID};
+use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::tests::{
     TEST_DISPLAY_HEIGHT, TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT,
     TEST_WORKSPACE_ID,
@@ -397,7 +397,7 @@ fn restore_plan_compacts_missing_windows_and_preserves_active_virtual_row() {
         ),
     ];
 
-    let plan = RestorePlanner::new(&state).plan(&current);
+    let plan = RestorePlanner::new(&state).plan(&current, &live_spaces());
 
     assert_eq!(plan.strips.len(), 1);
     assert_eq!(plan.strips[0].workspace_id, TEST_WORKSPACE_ID);
@@ -453,7 +453,7 @@ fn restore_plan_prefers_later_hard_match_over_earlier_fallback_match() {
         "Daily Notes",
     )];
 
-    let plan = RestorePlanner::new(&state).plan(&current);
+    let plan = RestorePlanner::new(&state).plan(&current, &live_spaces());
 
     assert_eq!(plan.strips.len(), 1);
     assert_eq!(plan.strips[0].virtual_index, 1);
@@ -488,13 +488,49 @@ fn restore_plan_skips_ambiguous_fallback_match() {
         CurrentWindowIdentity::fallback_only(second, "com.example.notes", "Daily Notes"),
     ];
 
-    let plan = RestorePlanner::new(&state).plan(&current);
+    let plan = RestorePlanner::new(&state).plan(&current, &live_spaces());
 
     assert!(plan.strips.is_empty());
     assert!(plan.active_virtual_by_workspace.is_empty());
     assert!(plan.consumed_entities.is_empty());
     assert_eq!(plan.ignored_missing_windows, 0);
     assert_eq!(plan.skipped_ambiguous_matches, 1);
+}
+
+/// A saved space macOS no longer has is skipped whole, so its windows stay
+/// unconsumed in the rows startup gave them.
+#[test]
+fn restore_plan_skips_space_that_no_longer_exists() {
+    use crate::ecs::restore::RestorePlanner;
+
+    let mut world = World::new();
+    let current_x = world.spawn_empty().id();
+    let saved = saved_window(20, 120, "org.mozilla.firefox", "YouTube");
+    let state = restore_state(vec![SavedWorkspace {
+        workspace_id: TEST_WORKSPACE_ID + 100,
+        display_id: Some(TEST_DISPLAY_ID),
+        active_virtual_index: None,
+        strips: vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved)],
+        }],
+    }]);
+    let current = vec![current_window(
+        current_x,
+        20,
+        120,
+        "org.mozilla.firefox",
+        "YouTube",
+    )];
+
+    let plan = RestorePlanner::new(&state).plan(&current, &live_spaces());
+
+    assert!(plan.strips.is_empty());
+    assert!(plan.consumed_entities.is_empty());
+}
+
+fn live_spaces() -> std::collections::HashSet<WorkspaceId> {
+    [TEST_WORKSPACE_ID].into_iter().collect()
 }
 
 fn restore_state(workspaces: Vec<SavedWorkspace>) -> PaneruState {
