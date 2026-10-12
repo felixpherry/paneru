@@ -1,13 +1,14 @@
 //! The `paneru …` CLI side of the protocol: sends requests to the running
 //! daemon and prints the answer as JSON. This is the only place JSON is
-//! produced; the daemon and its clients otherwise speak typed postcard values.
+//! produced; the daemon and its clients otherwise speak typed `MessagePack`
+//! values.
 
-use async_mach_ports::{SendPort, Sender};
-use futures_lite::StreamExt;
-use paneru_shared_types::state::{StateEvent, StateQueryKind};
-use paneru_shared_types::wire::{
-    QueryPayload, Request, Response, ScriptStateRequest, ScriptStateResponse, service_name,
+use crate::types::state::{StateEvent, StateQueryKind};
+use crate::types::wire::{
+    self, Error as WireError, QueryPayload, Request, Response, ScriptStateRequest,
+    ScriptStateResponse, SendPort, Sender, service_name,
 };
+use futures_lite::StreamExt;
 
 use crate::errors::{Error, Result};
 
@@ -17,8 +18,8 @@ use crate::errors::{Error, Result};
 ///
 /// Returns a plain "paneru is not running" error when no daemon is running.
 fn connect() -> Result<Sender<Request>> {
-    Sender::connect(&service_name()).map_err(|err| match err {
-        async_mach_ports::Error::NotRunning => Error::Generic("paneru is not running".to_string()),
+    wire::connect(&service_name()).map_err(|err| match err {
+        WireError::NotRunning => Error::Generic("paneru is not running".to_string()),
         other => Error::from(other),
     })
 }
@@ -31,7 +32,7 @@ fn connect() -> Result<Sender<Request>> {
 pub async fn send_command(argv: impl IntoIterator<Item = String>) -> Result<()> {
     let argv = argv.into_iter().collect::<Vec<_>>();
     let borrowed = argv.iter().map(String::as_str).collect::<Vec<_>>();
-    let command = paneru_shared_types::argv::parse_command(&borrowed)?;
+    let command = crate::types::argv::parse_command(&borrowed)?;
 
     connect()?.send(&Request::Command(command)).await?;
     Ok(())
@@ -94,7 +95,7 @@ pub async fn subscribe() -> Result<()> {
         let event = match delivery {
             Ok(delivery) => delivery.value,
             // The daemon exiting ends the subscription normally.
-            Err(async_mach_ports::Error::PeerGone) => break,
+            Err(WireError::PeerGone) => break,
             Err(err) => return Err(Error::from(err)),
         };
 

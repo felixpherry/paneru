@@ -4,7 +4,7 @@
 //! TOML `[bindings]` keys are split into, so parsing and formatting live
 //! together here and are checked against each other by round-trip tests.
 
-use crate::commands::{
+use crate::types::commands::{
     Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
     parse_virtual_workspace_number,
 };
@@ -49,6 +49,8 @@ pub fn parse_command(argv: &[&str]) -> Result<Command> {
         "quit" => Command::Quit,
         "restart" => Command::Restart,
         "overview" => Command::Overview,
+        "showmenu" if argv.len() == 1 => Command::MenuBar(true),
+        "hidemenu" if argv.len() == 1 => Command::MenuBar(false),
         _ => return Err(ParseError::new(format!("unhandled command '{argv:?}'"))),
     })
 }
@@ -94,6 +96,7 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "balance" => Operation::Balance,
         "stack" => Operation::Stack(true),
         "unstack" => Operation::Stack(false),
+        "tabbeddisplay" => Operation::ToggleTabbedDisplay,
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
         "display" => Operation::ToDisplay(Direction::parse(argument()?)?),
@@ -181,6 +184,9 @@ impl Command {
             Command::Restart => vec!["restart".to_string()],
             Command::PrintState => vec!["printstate".to_string()],
             Command::Overview => vec!["overview".to_string()],
+            Command::MenuBar(enabled) => {
+                vec![if *enabled { "showmenu" } else { "hidemenu" }.to_string()]
+            }
             Command::Lua(_) | Command::Layout(_) => return None,
         };
         Some(argv)
@@ -210,6 +216,7 @@ impl Operation {
             Operation::Manage => owned(&["manage"]),
             Operation::Stack(true) => owned(&["stack"]),
             Operation::Stack(false) => owned(&["unstack"]),
+            Operation::ToggleTabbedDisplay => owned(&["tabbeddisplay"]),
             Operation::Snap => owned(&["snap"]),
             Operation::Virtual(direction) => vec!["virtual".to_string(), direction.token()],
             Operation::FocusOrVirtual(direction) => {
@@ -271,6 +278,7 @@ mod tests {
             Operation::Manage,
             Operation::Stack(true),
             Operation::Stack(false),
+            Operation::ToggleTabbedDisplay,
             Operation::Snap,
             Operation::Virtual(Direction::First),
             Operation::FocusOrVirtual(Direction::North),
@@ -306,6 +314,8 @@ mod tests {
             Command::Restart,
             Command::PrintState,
             Command::Overview,
+            Command::MenuBar(true),
+            Command::MenuBar(false),
             Command::Mouse(MouseMove::ToNextDisplay),
             Command::Mouse(MouseMove::ToDisplay(Direction::North)),
         ] {
@@ -344,5 +354,7 @@ mod tests {
         assert!(parse_command(&["definitely", "not", "a", "command"]).is_err());
         assert!(parse_command(&["window", "focus"]).is_err());
         assert!(parse_command(&["window", "swap", "3"]).is_err());
+        assert!(parse_command(&["showmenu", "extra"]).is_err());
+        assert!(parse_command(&["hidemenu", "extra"]).is_err());
     }
 }

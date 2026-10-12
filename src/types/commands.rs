@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::argv::{ParseError, parse_command};
+pub use crate::types::argv::{ParseError, parse_command};
 
 /// Represents a cardinal or directional choice for window manipulation.
 ///
@@ -245,6 +245,11 @@ pub enum Operation {
     Manage,
     /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
     Stack(bool),
+    /// Toggles the focused window's stack between a normal split display
+    /// (all windows visible, sharing height) and a tabbed display (one
+    /// window visible at a time, sharing the full column). Cycle tabs with
+    /// the existing `Focus` North/South directions.
+    ToggleTabbedDisplay,
     /// Resizes and repositions the focused window to fit within the visible viewport
     /// (including edge padding).
     Snap,
@@ -318,5 +323,7 @@ pub enum Command {
     /// Layout operations a Lua handler produced by transforming a `WindowSet`.
     /// Window-addressed, unlike every other command here, and applied
     /// best-effort: see `ecs::layout_ops`. Never produced by parsing.
-    Layout(Vec<crate::windowset::LayoutOp>),
+    Layout(Vec<crate::types::windowset::LayoutOp>),
+    /// Shows or hides the menu bar item and remembers the choice.
+    MenuBar(bool),
 }

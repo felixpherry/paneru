@@ -21,7 +21,7 @@ use crate::ecs::params::Windows;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker, Unmanaged};
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
-use paneru_shared_types::windowset::WindowSet;
+use crate::types::windowset::WindowSet;
 
 pub const STATE_FILE_NAME: &str = "state.json";
 const SUPPORTED_STATE_VERSION: u32 = 2;
@@ -97,7 +97,7 @@ pub struct SavedWindow {
 
 // These wire-format types live in the shared `paneru_shared_types` crate;
 // aliased here to the names the rest of the daemon already uses.
-pub use paneru_shared_types::state::{
+pub use crate::types::state::{
     ActiveState as PaneruActiveState, Frame, QueryState as PaneruQueryState, StateEvent,
     StateQueryKind, VirtualWorkspaceState as PaneruVirtualWorkspaceState,
     WindowState as PaneruWindowState,
@@ -459,7 +459,7 @@ impl QueryStateParams<'_, '_> {
 /// `ws:east`, `ws:stack` and friends to know what is beside what.
 impl QueryStateParams<'_, '_> {
     pub fn extract_window_set(&self) -> crate::errors::Result<WindowSet> {
-        use paneru_shared_types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
+        use crate::types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
 
         let focused_entity = self.windows.focused().map(|(_, entity)| entity);
         let sliver_width = self.config.sliver_width();
@@ -579,7 +579,7 @@ impl QueryStateParams<'_, '_> {
         entity: Entity,
         focused: Option<Entity>,
         sliver_width: i32,
-    ) -> Option<paneru_shared_types::windowset::WindowRec> {
+    ) -> Option<crate::types::windowset::WindowRec> {
         let (window, _, unmanaged) = self.windows.get_managed(entity)?;
         let (_, _, app_entity) = self.windows.find_parent(window.id())?;
         let app = self.apps.get(app_entity).ok()?;
@@ -591,11 +591,13 @@ impl QueryStateParams<'_, '_> {
             .and_then(|frame| window_visibility(frame, &self.displays, sliver_width))
             .is_some_and(|(_, visible)| visible && !hidden);
 
-        Some(paneru_shared_types::windowset::WindowRec {
+        Some(crate::types::windowset::WindowRec {
             id: window.id(),
             app_name: app.name().to_string(),
             bundle_id: app.bundle_id().unwrap_or_default().clone(),
             title: window.title().unwrap_or_default(),
+            role: window.role().ok(),
+            subrole: window.subrole().ok(),
             frame: frame.map(|frame| Frame {
                 x: frame.min.x,
                 y: frame.min.y,
@@ -611,8 +613,8 @@ impl QueryStateParams<'_, '_> {
 }
 
 /// How a layout column arranges its windows, in the vocabulary a script sees.
-fn column_kind(column: &Column) -> paneru_shared_types::windowset::ColumnKind {
-    use paneru_shared_types::windowset::ColumnKind;
+fn column_kind(column: &Column) -> crate::types::windowset::ColumnKind {
+    use crate::types::windowset::ColumnKind;
     match column {
         Column::Single(_) => ColumnKind::Single,
         Column::Stack(_) => ColumnKind::Stack,
@@ -712,6 +714,8 @@ impl QueryState for PaneruQueryState {
                         bundle_id,
                         app_name,
                         title,
+                        role: window.role().ok(),
+                        subrole: window.subrole().ok(),
                         focused: focused_entity == Some(entity),
                         floating: matches!(unmanaged, Some(Unmanaged::Floating)),
                         display_id: visibility.map(|(display_id, _)| display_id),

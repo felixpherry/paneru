@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
@@ -91,6 +91,9 @@ struct MockStateInner {
     unordered_windows: HashSet<WinID>,
     /// Windows whose close button was pressed, in order.
     closed: Vec<WinID>,
+    /// Windows the app keeps out of its accessibility window list while the
+    /// window server still reports them on screen: a background native tab.
+    background_tabs: HashSet<WinID>,
 }
 
 #[derive(Clone)]
@@ -112,6 +115,7 @@ impl MockState {
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
                 closed: Vec::new(),
+                background_tabs: HashSet::new(),
             })),
         }
     }
@@ -128,6 +132,19 @@ impl MockState {
             inner.unordered_windows.insert(window_id);
         } else {
             inner.unordered_windows.remove(&window_id);
+        }
+    }
+
+    /// Makes `window_id` a background native tab: on screen as far as the
+    /// window server is concerned, absent from the app's accessibility window
+    /// list. This is what Ghostty does with every tab but the selected one.
+    #[allow(unused)]
+    pub fn set_background_tab(&self, window_id: WinID, background: bool) {
+        let mut inner = self.inner.force_write();
+        if background {
+            inner.background_tabs.insert(window_id);
+        } else {
+            inner.background_tabs.remove(&window_id);
         }
     }
 
@@ -242,6 +259,11 @@ impl MockState {
         );
     }
 
+    pub fn set_display_bounds(&self, id: u32, bounds: IRect) {
+        let mut inner = self.inner.force_write();
+        inner.displays.get_mut(&id).expect("finding display").bounds = bounds;
+    }
+
     #[allow(unused)]
     pub fn remove_display(&self, id: u32) {
         let mut inner = self.inner.force_write();
@@ -259,6 +281,13 @@ impl MockState {
     /// the next `Event::DisplayChanged`.
     pub fn set_active_display(&self, id: u32) {
         self.inner.force_write().active_display_id = id;
+    }
+
+    pub(crate) fn activate_display(&self, id: CGDirectDisplayID) {
+        let mut inner = self.inner.force_write();
+        assert!(inner.displays.contains_key(&id), "finding display");
+        inner.active_display_id = id;
+        inner.event_queue.push_back(Event::DisplayChanged);
     }
 
     pub(crate) fn activate_workspace(
@@ -535,23 +564,52 @@ impl MockState {
         });
 
         let s = self.clone();
+        // Cached after the first successful read, like `WindowOS::role`, so a
+        // closed window keeps reporting its role here too.
+        let cached_role = Arc::new(OnceLock::<String>::new());
         mw.expect_role().returning(move || {
-            s.inner
+            if let Some(role) = cached_role.get() {
+                return Ok(role.clone());
+            }
+            let role = s
+                .inner
                 .force_read()
                 .windows
                 .get(&id)
                 .map(|w| w.role.clone())
-                .ok_or_else(|| crate::errors::Error::Generic(format!("window {id} not found")))
+                .ok_or_else(|| crate::errors::Error::Generic(format!("window {id} not found")))?;
+            if role != accessibility_sys::kAXUnknownRole {
+                let _ = cached_role.set(role.clone());
+            }
+            Ok(role)
         });
 
         let s = self.clone();
+        mw.expect_is_alive()
+            .returning(move || s.inner.force_read().windows.contains_key(&id));
+
+        let s = self.clone();
+        // An empty subrole models a window without an `AXSubrole` attribute,
+        // which AX reports as an error rather than an empty string.
+        let cached_subrole = Arc::new(OnceLock::<String>::new());
         mw.expect_subrole().returning(move || {
-            Ok(s.inner
+            if let Some(subrole) = cached_subrole.get() {
+                return Ok(subrole.clone());
+            }
+            let subrole = s
+                .inner
                 .force_read()
                 .windows
                 .get(&id)
                 .map(|w| w.subrole.clone())
-                .unwrap_or_default())
+                .filter(|subrole| !subrole.is_empty())
+                .ok_or_else(|| {
+                    crate::errors::Error::Generic(format!("window {id} has no subrole"))
+                })?;
+            if subrole != accessibility_sys::kAXUnknownSubrole {
+                let _ = cached_subrole.set(subrole.clone());
+            }
+            Ok(subrole)
         });
 
         let s = self.clone();
@@ -717,6 +775,15 @@ impl MockState {
         let (s, ids) = (self.clone(), window_ids.clone());
         ma.expect_window_list()
             .returning(move |_| ids().into_iter().map(|id| s.create_window(id)).collect());
+
+        let (s, ids) = (self.clone(), window_ids.clone());
+        ma.expect_ax_window_ids().returning(move || {
+            let background = s.inner.force_read().background_tabs.clone();
+            ids()
+                .into_iter()
+                .filter(|id| !background.contains(id))
+                .collect()
+        });
 
         Application::new(Box::new(ma))
     }

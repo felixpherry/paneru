@@ -1,6 +1,6 @@
 use bevy::app::AppExit;
 use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut};
-use bevy::ecs::entity::Entity;
+use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
@@ -14,7 +14,7 @@ use bevy::time::Time;
 use objc2_foundation::NSPoint;
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
@@ -507,14 +507,18 @@ pub(super) fn timeout_ticker(
 ) {
     for (entity, mut timeout) in timers {
         if timeout.timer.is_finished() {
-            trace!("Despawning entity {entity} due to timeout.");
             if let Some(system_id) = timeout.system_id.take() {
                 commands.run_system(system_id);
                 commands.unregister_system(system_id);
             }
-            trace!("Removing timer {entity}");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_despawn();
+                if let Some(on_expire) = timeout.on_expire {
+                    trace!("Expiring component timer on {entity}.");
+                    on_expire(&mut entity_commands);
+                } else {
+                    trace!("Despawning entity {entity} due to timeout.");
+                    entity_commands.try_despawn();
+                }
             }
         } else {
             timeout.timer.tick(clock.delta());
@@ -558,6 +562,16 @@ pub(super) fn retry_front_switch(
     }
 }
 
+/// Upper bound on the timestep fed into [`ease_out_factor`].
+///
+/// When the event loop wakes from an idle sleep (up to 500ms, or 2s in low
+/// power mode), `Time::delta_secs_f64()` reports the entire sleep duration on
+/// the wakeup frame. Feeding that straight into the exponential decay would
+/// consume almost the entire distance on Frame 0 and turn the animation into a
+/// single-frame jump. Cap each frame's step to a 30fps tick (matching the
+/// scroll integrator's `MAX_STEP_SECS`) so the wakeup frame steps smoothly.
+const MAX_ANIMATION_STEP_SECS: f64 = 1.0 / 30.0;
+
 /// Animates window movement.
 /// Fraction of the remaining distance an exponential ease-out consumes in a
 /// frame, given a decay `rate` (per second) and the frame's `delta` in seconds.
@@ -567,6 +581,7 @@ pub(super) fn retry_front_switch(
     reason = "clamped to [0, 1], well within f32's range; only sub-pixel precision is lost"
 )]
 pub(crate) fn ease_out_factor(rate: f64, delta: f64) -> f32 {
+    let delta = delta.min(MAX_ANIMATION_STEP_SECS);
     (1.0 - (-rate * delta).exp()).clamp(0.0, 1.0) as f32
 }
 
@@ -721,15 +736,11 @@ pub(crate) fn pump_events(
             break false;
         }
 
-        // Polled before any timed wait: the Cocoa pump above already did this
-        // frame's sleeping, so a quiet channel used to cost another millisecond.
-        let received = match incoming_events.try_recv() {
-            Err(TryRecvError::Empty) => incoming_events.recv_timeout(Duration::from_millis(1)),
-            Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
-            Ok(event) => Ok(event),
-        };
-        match received {
-            Ok(Event::Exit) | Err(RecvTimeoutError::Disconnected) => {
+        // Non-blocking drain: the Cocoa pump above already did this frame's
+        // sleeping, so an empty channel means we can proceed immediately
+        // without paying an extra millisecond of wait latency.
+        match incoming_events.try_recv() {
+            Ok(Event::Exit) | Err(TryRecvError::Disconnected) => {
                 exit.write(AppExit::Success);
                 return;
             }
@@ -743,7 +754,7 @@ pub(crate) fn pump_events(
                 }
                 *timeout = LOOP_TIMEOUT_STEP;
             }
-            Err(RecvTimeoutError::Timeout) => break true,
+            Err(TryRecvError::Empty) => break true,
         }
     };
 
@@ -1110,9 +1121,13 @@ pub(super) fn update_overlays(
 pub(super) fn commit_window_position(
     mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
 ) {
+    // `par_iter_mut` runs on `ComputeTaskPool` worker threads, which have no
+    // `CFRunLoop` of their own to drain thread-local autorelease pools.
     moved_windows
         .par_iter_mut()
-        .for_each(|(mut window, position)| window.reposition(position.0));
+        .for_each(|(mut window, position)| {
+            objc2::rc::autoreleasepool(|_| window.reposition(position.0));
+        });
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -1150,7 +1165,7 @@ pub(super) fn commit_window_size(
         .par_iter_mut()
         .for_each(|(mut window, size, mut width_ratio)| {
             width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
-            window.resize(size.0);
+            objc2::rc::autoreleasepool(|_| window.resize(size.0));
         });
 }
 
@@ -1326,6 +1341,18 @@ type SettledWindows<'w, 's> = Query<
     ),
 >;
 
+/// Whether the app is showing `window_id` right now.
+///
+/// Two signals, because neither alone covers a native tab: the window server
+/// stops listing a window it has ordered out, and an app drops a background tab
+/// from its accessibility list while the window server still calls that tab on
+/// screen. Ghostty does the latter. An empty accessibility list is an app that
+/// did not answer, not an app showing nothing.
+fn app_shows_window(ax_window_ids: &[WinID], on_screen: &[WinID], window_id: WinID) -> bool {
+    on_screen.contains(&window_id)
+        && (ax_window_ids.is_empty() || ax_window_ids.contains(&window_id))
+}
+
 /// Folds a background native tab that ended up in a column of its own back into
 /// the column of the tab that is actually showing.
 ///
@@ -1336,12 +1363,13 @@ type SettledWindows<'w, 's> = Query<
 /// there is nothing there.
 ///
 /// Deliberately narrow. Two managed windows of one app share a frame exactly
-/// only when they share a column, which is what this is repairing, and the
-/// window server reports a background tab as not on screen while an occluded
-/// window still counts as on screen.
+/// only when they share a column, which is what this is repairing, and
+/// [`app_shows_window`] is what tells a background tab from a window the user
+/// can see.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn regroup_stray_native_tabs(
     windows: SettledWindows,
+    apps: Query<&Application>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
     mission_control: Res<MissionControlActive>,
@@ -1372,36 +1400,45 @@ pub(crate) fn regroup_stray_native_tabs(
             Column::Stack(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
         })
         .collect::<Vec<_>>();
+    // One accessibility round trip per app, not per window: this runs on a timer
+    // and the call crosses into the app.
+    let mut ax_windows: EntityHashMap<Vec<WinID>> = EntityHashMap::default();
     let columns = tops
         .into_iter()
         .filter_map(|entity| windows.get(entity).ok())
         .map(
             |(entity, window, Position(position), Bounds(bounds), child)| {
+                let app = child.parent();
+                let ax_window_ids = ax_windows.entry(app).or_insert_with(|| {
+                    apps.get(app)
+                        .map(|app| app.ax_window_ids())
+                        .unwrap_or_default()
+                });
                 (
                     entity,
-                    on_screen.contains(&window.id()),
+                    app_shows_window(ax_window_ids, &on_screen, window.id()),
                     *position,
                     *bounds,
-                    child.parent(),
+                    app,
                 )
             },
         )
         .collect::<Vec<_>>();
 
     let mut regrouped = Vec::new();
-    for (hidden, on_screen_now, position, bounds, app) in &columns {
-        if *on_screen_now || regrouped.contains(hidden) || !strays.contains(hidden) {
+    for (hidden, showing, position, bounds, app) in &columns {
+        if *showing || regrouped.contains(hidden) || !strays.contains(hidden) {
             continue;
         }
         let Some((leader, ..)) = columns.iter().find(
             |(
                 candidate,
-                candidate_on_screen,
+                candidate_showing,
                 candidate_position,
                 candidate_bounds,
                 candidate_app,
             )| {
-                *candidate_on_screen
+                *candidate_showing
                     && candidate != hidden
                     && candidate_app == app
                     && candidate_position.chebyshev_distance(*position) <= 1
@@ -1429,7 +1466,7 @@ pub(crate) fn regroup_stray_native_tabs(
 pub(crate) fn detect_tabbed_windows(
     created: Populated<(Entity, &Position, &Bounds, &ChildOf), Added<Window>>,
     windows: Query<(Entity, &Window, &Position, &Bounds, &ChildOf), With<Window>>,
-    apps: Query<Entity, With<Application>>,
+    apps: Query<(Entity, &Application)>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
     active_display: Single<&Display, With<ActiveDisplayMarker>>,
@@ -1444,7 +1481,7 @@ pub(crate) fn detect_tabbed_windows(
     };
 
     for (entity, Position(position), Bounds(bounds), child) in created {
-        let Ok(app_entity) = apps.get(child.parent()) else {
+        let Ok((app_entity, app)) = apps.get(child.parent()) else {
             continue;
         };
 
@@ -1459,13 +1496,24 @@ pub(crate) fn detect_tabbed_windows(
                     && leader_bounds.chebyshev_distance(*bounds) <= 1
             })
             .collect::<Vec<_>>();
+        if same_size.is_empty() {
+            continue;
+        }
+
+        let on_screen = window_manager.windows_on_screen().unwrap_or_default();
+        let ax_window_ids = app.ax_window_ids();
+        // A leader the app has stopped showing is the tab this one replaced.
+        let hidden_leader = |leader_id| !app_shows_window(&ax_window_ids, &on_screen, leader_id);
 
         // Now check whether any of these found windows have the same position?
         let tabbed = same_size
             .iter()
             .find_map(|(leader, window, Position(leader_position), _, _)| {
-                // If the window has a positional match, it's tabbed!
-                (leader_position.chebyshev_distance(*position) <= 1)
+                // If the window has a positional match, it's tabbed! The hidden
+                // test belongs here rather than after the search: a group the
+                // app is already showing one member of would otherwise be
+                // picked and then rejected, hiding the sibling that matches.
+                (leader_position.chebyshev_distance(*position) <= 1 && hidden_leader(window.id()))
                     .then_some((*leader, window.id()))
             })
             .or_else(|| {
@@ -1485,9 +1533,7 @@ pub(crate) fn detect_tabbed_windows(
             });
 
         if let Some((leader, leader_id)) = tabbed
-            && window_manager
-                .windows_on_screen()
-                .is_some_and(|ids| !ids.contains(&leader_id))
+            && hidden_leader(leader_id)
             && let Some((mut strip, _)) =
                 workspaces.iter_mut().find(|strip| strip.0.contains(leader))
             && strip.contains(leader)

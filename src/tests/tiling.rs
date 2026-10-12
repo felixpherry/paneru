@@ -1,13 +1,110 @@
 use std::time::Duration;
 
 use crate::commands::{Command, Direction, Operation, ResizeDirection};
-use crate::config::{Config, MainOptions, WindowParams};
+use crate::config::{
+    Config, InitialWindowWidth, InitialWindowWidthMode, MainOptions, WindowParams,
+};
+use crate::ecs::SpawnWindowTrigger;
 use crate::ecs::layout::LayoutStrip;
-use crate::events::Event;
+use crate::events::{DestroySource, Event};
 use crate::{assert_window_at, assert_window_size};
+use bevy::math::IRect;
 use bevy::prelude::*;
 
 use super::*;
+
+#[test]
+fn new_window_starts_at_complement_of_focused_width() {
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Mode(
+        InitialWindowWidthMode::ComplementFocused,
+    ));
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_focused_window(0)
+        .on_iteration(0, move |world, state| {
+            world.insert_resource(config.clone());
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(1, |world, _state| {
+            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, 748);
+            assert_window_size!(world, 1, TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH, 748);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+#[test]
+fn new_window_starts_full_width_after_full_width_focus() {
+    let mut fixed = WindowParams::new(".*", None);
+    fixed.width = Some(InitialWindowWidth::Ratio(1.0));
+    let fixed_config: Config = (MainOptions::default(), vec![fixed]).into();
+
+    let mut dynamic = WindowParams::new(".*", None);
+    dynamic.width = Some(InitialWindowWidth::Mode(
+        InitialWindowWidthMode::ComplementFocused,
+    ));
+    let dynamic_config: Config = (MainOptions::default(), vec![dynamic]).into();
+
+    TestHarness::new()
+        .with_config(fixed_config)
+        .with_windows(1)
+        .with_focused_window(0)
+        .on_iteration(0, move |world, state| {
+            assert_window_size!(world, 0, TEST_DISPLAY_WIDTH, 748);
+            world.insert_resource(dynamic_config.clone());
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(1, |world, _state| {
+            assert_window_size!(world, 1, TEST_DISPLAY_WIDTH, 748);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+#[test]
+fn configured_width_uses_raw_display_bounds_with_edge_padding() {
+    let options = MainOptions {
+        padding_left: Some(20),
+        padding_right: Some(30),
+        ..MainOptions::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Ratio(0.5));
+    let config: Config = (options, vec![params]).into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .on_iteration(0, |world, state| {
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(1, |world, _state| {
+            assert_window_size!(world, 1, TEST_DISPLAY_WIDTH / 2, 748);
+            let mut query = world.query::<(&crate::manager::Window, &crate::ecs::WidthRatio)>();
+            let ratio = query
+                .iter(world)
+                .find_map(|(window, ratio)| (window.id() == 1).then_some(ratio.0));
+            assert_eq!(ratio, Some(0.5));
+        })
+        .run(vec![Event::MenuOpened { window_id: 0 }]);
+}
 
 #[test]
 #[allow(clippy::too_many_lines)]
@@ -407,7 +504,7 @@ fn test_window_can_resize_to_two_display_widths_and_scroll() {
 /// overwrites from the live frame.
 #[test]
 fn test_lua_set_width_layout_op_resizes_the_focused_window() {
-    use paneru_shared_types::windowset::LayoutOp;
+    use crate::types::windowset::LayoutOp;
 
     const VIEWPORT_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
 
@@ -592,6 +689,70 @@ fn test_closing_window_of_live_app_closes_the_gap() {
         .run(commands);
 }
 
+/// A space notification for a window whose AX element is gone is a real close,
+/// not a space change. It must be recognised on its own, without waiting for
+/// the periodic unordered-window sweep, even though `role()` is cached.
+#[test]
+fn test_space_notification_for_dead_window_removes_it() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.advance(Duration::from_millis(100));
+
+    harness.mock_state.os_vanish_window(1);
+    harness
+        .app
+        .world_mut()
+        .write_message::<Event>(Event::WindowDestroyed {
+            window_id: 1,
+            source: DestroySource::SpaceNotification,
+        });
+    // Well short of the 1-second CLOSED_WINDOW_CHECK_FREQ sweep, so only the
+    // destroy event can remove the window.
+    harness.advance(Duration::from_millis(60));
+
+    assert!(
+        !window_exists(harness.app.world_mut(), 1),
+        "a space notification for a dead window must remove it"
+    );
+}
+
+/// Closing a floating window despawns it, which removes its `Unmanaged` marker.
+/// That removal must not put the dying window back into the layout strip.
+#[test]
+fn test_closing_floating_window_does_not_reinsert_it_into_the_strip() {
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    let mut params = WindowParams::new("^Window 1$", None);
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.os_close_window(1))
+        .on_iteration(1, |world, _state| {
+            assert!(!window_exists(world, 1), "closed window must be despawned");
+            let mut strips = world.query::<&LayoutStrip>();
+            let entities = strips
+                .iter(world)
+                .flat_map(LayoutStrip::all_windows)
+                .collect::<Vec<_>>();
+            for entity in entities {
+                assert!(
+                    world.get::<crate::manager::Window>(entity).is_some(),
+                    "strip holds {entity}, which is no longer a window"
+                );
+            }
+        })
+        .run(commands);
+}
+
 fn window_x(world: &mut World, id: i32) -> i32 {
     let mut query = world.query::<&crate::manager::Window>();
     query
@@ -606,4 +767,45 @@ fn window_x(world: &mut World, id: i32) -> i32 {
 fn window_exists(world: &mut World, id: i32) -> bool {
     let mut query = world.query::<&crate::manager::Window>();
     query.iter(world).any(|window| window.id() == id)
+}
+
+/// A `subrole` window rule applies its effects only to windows reporting that
+/// subrole: an app's dialog floats while its standard window stays tiled.
+#[test]
+fn test_subrole_window_rule_floats_only_matching_windows() {
+    let config = Config::try_from(
+        r#"
+[options]
+
+[bindings]
+
+[windows.dialogs]
+title = ".*"
+subrole = "AXDialog"
+floating = true
+"#,
+    )
+    .expect("config should parse");
+
+    let commands = vec![Event::Command {
+        command: Command::PrintState,
+    }];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_window(1, |window| window.subrole = "AXDialog".to_string())
+        // Iterations are 0-indexed: this is the only command's iteration.
+        .on_iteration(0, |world, _state| {
+            let is_floating = |world: &mut World, id| {
+                let entity = find_window_entity(id, world);
+                matches!(
+                    world.entity(entity).get::<crate::ecs::Unmanaged>(),
+                    Some(crate::ecs::Unmanaged::Floating)
+                )
+            };
+            assert!(!is_floating(world, 0), "standard window must stay tiled");
+            assert!(is_floating(world, 1), "dialog must float");
+        })
+        .run(commands);
 }

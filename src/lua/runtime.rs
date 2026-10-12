@@ -10,15 +10,15 @@
 //! suspends rather than blocking — so nothing here may hold a `RefCell`
 //! borrow across an await.
 
-use paneru_shared_types::script_value::ScriptValue;
+use crate::types::script_value::ScriptValue;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
+use crate::types::windowset::WindowSet;
 use mlua::prelude::{FromLua, IntoLua};
 use mlua::{AnyUserData, Function, Lua, LuaOptions, StdLib, Table, Value};
-use paneru_shared_types::windowset::WindowSet;
 use tracing::{error, warn};
 
 use super::api;
@@ -202,11 +202,19 @@ impl LuaRuntime {
         self.built_config.as_ref()
     }
 
-    /// Whether the script registered any `paneru.on` handler. Building the Lua
-    /// table for an event is the costly step, so a script that only binds keys
-    /// pays nothing for events it can never observe.
-    pub(super) fn has_event_handlers(&self) -> bool {
-        !self.registry.borrow().handlers.is_empty()
+    /// Bitmask of [`LuaEvent`] kinds that have at least one registered
+    /// `paneru.on` handler.
+    ///
+    /// [`LuaEvent`]: super::convert::LuaEvent
+    pub(super) fn subscribed_event_mask(&self) -> u64 {
+        self.registry
+            .borrow()
+            .handlers
+            .iter()
+            .filter(|(_, entries)| !entries.is_empty())
+            .fold(0u64, |mask, (name, _)| {
+                mask | super::convert::LuaEvent::bit_for_name(name)
+            })
     }
 
     /// The handlers registered for `name`, in registration order.
@@ -337,10 +345,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
+    use crate::types::windowset::WindowSet;
     use async_channel::{Receiver, unbounded};
     use futures_lite::future::{block_on, poll_once};
-    use paneru_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
-    use paneru_shared_types::windowset::WindowSet;
 
     use super::super::convert;
     use super::super::worker::{Shared, StoreRequest, WorldRequest};
@@ -520,6 +528,42 @@ mod tests {
     }
 
     #[test]
+    fn require_paneru_uses_embedded_api_without_a_native_module() {
+        let world = TestWorld::default();
+        let runtime = world
+            .runtime(
+                r#"
+                local api = require("paneru")
+                assert(api == paneru)
+                api.setup { options = { sliver_width = 7 } }
+                api.bind("alt - j", "window focus east")
+                "#,
+            )
+            .expect("the embedded API should be available to require");
+
+        assert_eq!(runtime.built_config().unwrap().sliver_width(), 7);
+        assert_eq!(runtime.published_keybinds().len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn setup_accepts_complement_focused_width() {
+        let world = TestWorld::default();
+        let runtime = world
+            .runtime(
+                r#"paneru.setup{
+                windows = { all = { title = ".*", width = "complement_focused" } },
+            }"#,
+            )
+            .expect("Lua width rule parses");
+        let config = runtime.built_config().expect("setup should build a config");
+        let width = config.find_window_properties("Window 1", "", None, None)[0]
+            .width
+            .expect("matched width rule");
+        assert_eq!(width.ratio(Some(0.25)), 0.75);
+    }
+
+    #[test]
     fn no_setup_call_leaves_config_to_toml() {
         let world = TestWorld::default();
         let runtime = world
@@ -607,6 +651,8 @@ mod tests {
                     bundle_id: "com.example.app".to_string(),
                     app_name: "Test App".to_string(),
                     title: "window".to_string(),
+                    role: Some("AXWindow".to_string()),
+                    subrole: Some("AXStandardWindow".to_string()),
                     focused: true,
                     floating: false,
                     display_id: Some(1),
@@ -650,6 +696,33 @@ mod tests {
             "paneru.query should return raw JSON, got {}",
             flashes[2]
         );
+    }
+
+    #[test]
+    fn queried_windows_expose_role_and_subrole() {
+        let world = TestWorld::default();
+        let runtime = world
+            .runtime(
+                r#"
+            paneru.bind("alt - q", function()
+              local window = paneru.query_workspaces()[1].windows[1]
+              paneru.flash(window.role)
+              paneru.flash(window.subrole)
+            end)
+            "#,
+            )
+            .unwrap();
+        let extract = || Ok(Arc::new(test_state()));
+        world.drive(&extract, runtime.dispatch_bind(1));
+
+        let flashes: Vec<String> = runtime
+            .outbox
+            .borrow_mut()
+            .flashes
+            .drain(..)
+            .map(|(message, _)| message)
+            .collect();
+        assert_eq!(flashes, ["AXWindow", "AXStandardWindow"]);
     }
 
     #[test]
@@ -774,7 +847,7 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(flashes, vec![("done".to_string(), 3.0)]);
         // ...and the outbox is empty afterwards, so nothing is delivered twice.
-        assert!(runtime.drain_outbox().0.is_empty());
+        assert_eq!(runtime.drain_outbox().0, []);
     }
 
     /// Runs `source` as a keybind handler against `world`'s store.
@@ -1028,7 +1101,7 @@ mod tests {
     fn empty_runtime_has_no_binds() {
         let world = TestWorld::default();
         let runtime = LuaRuntime::empty(&world.dispatch);
-        assert!(runtime.published_keybinds().is_empty());
+        assert_eq!(runtime.published_keybinds(), []);
     }
 
     #[test]
@@ -1046,5 +1119,81 @@ mod tests {
             path.starts_with("/tmp/paneru-test/?.lua;"),
             "expected the extra path to be prepended, got {path}"
         );
+    }
+
+    #[test]
+    fn paneru_config_has_resolved_defaults_before_setup() {
+        let world = TestWorld::default();
+        let runtime = world
+            .runtime(
+                r"
+                ffm = paneru.config.options.focus_follows_mouse
+                sliver = paneru.config.options.sliver_width
+                presets_len = #paneru.config.options.preset_column_widths
+                pad_top = paneru.config.padding.top
+                ws_count = paneru.config.default_workspaces
+                menu_enabled = paneru.config.decorations.menu.enabled
+                ",
+            )
+            .expect("script should load");
+
+        let globals = runtime.lua.globals();
+        assert!(globals.get::<bool>("ffm").unwrap());
+        assert_eq!(globals.get::<i32>("sliver").unwrap(), 5);
+        assert_eq!(globals.get::<usize>("presets_len").unwrap(), 8);
+        assert_eq!(globals.get::<i32>("pad_top").unwrap(), 0);
+        assert_eq!(globals.get::<u32>("ws_count").unwrap(), 1);
+        assert!(globals.get::<bool>("menu_enabled").unwrap());
+    }
+
+    #[test]
+    fn paneru_setup_updates_paneru_config_and_merges_defaults() {
+        let world = TestWorld::default();
+        let runtime = world
+            .runtime(
+                r#"
+                paneru.setup {
+                  default_workspaces = 4,
+                  options = {
+                    focus_follows_mouse = false,
+                    preset_column_widths = { 0.5, 1.0 },
+                    custom_tag = "user_data",
+                  },
+                  padding = { top = 12 },
+                  decorations = { menu = { enabled = false } },
+                }
+
+                ffm = paneru.config.options.focus_follows_mouse
+                sliver = paneru.config.options.sliver_width
+                presets_len = #paneru.config.options.preset_column_widths
+                custom = paneru.config.options.custom_tag
+                pad_top = paneru.config.padding.top
+                pad_bottom = paneru.config.padding.bottom
+                ws_count = paneru.config.default_workspaces
+                menu_enabled = paneru.config.decorations.menu.enabled
+
+                paneru.bind("alt - x", function()
+                  if not paneru.config.options.focus_follows_mouse and paneru.config.padding.top == 12 then
+                    paneru.run("window balance")
+                  end
+                end)
+                "#,
+            )
+            .expect("script should load");
+
+        let globals = runtime.lua.globals();
+        assert!(!globals.get::<bool>("ffm").unwrap());
+        assert_eq!(globals.get::<i32>("sliver").unwrap(), 5);
+        assert_eq!(globals.get::<usize>("presets_len").unwrap(), 2);
+        assert_eq!(globals.get::<String>("custom").unwrap(), "user_data");
+        assert_eq!(globals.get::<i32>("pad_top").unwrap(), 12);
+        assert_eq!(globals.get::<i32>("pad_bottom").unwrap(), 0);
+        assert_eq!(globals.get::<u32>("ws_count").unwrap(), 4);
+        assert!(!globals.get::<bool>("menu_enabled").unwrap());
+        assert!(!runtime.built_config().unwrap().menubar_enabled());
+
+        let extract = || Ok(Arc::new(test_state()));
+        world.drive(&extract, runtime.dispatch_bind(1));
+        assert_eq!(drained_commands(&runtime).len(), 1);
     }
 }

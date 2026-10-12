@@ -11,8 +11,8 @@ a terminal — and `jq`, and a status bar's shell script — needs text. Anythin
 consuming these commands' output sees exactly the shapes documented here.
 
 A client written in Rust can skip the JSON entirely by using the
-`paneru-shared-types` crate: its `wire::Request` and `wire::Response` are the
-protocol, and `paneru-mach-ipc` is the transport.
+`paneru::types` module (`src/types`): its `wire::Request` and `wire::Response`
+are the protocol, and `async-mach-ports` is the transport.
 
 All query responses are a single JSON document. `subscribe` emits
 line-delimited JSON, with one complete event object per line.
@@ -68,6 +68,8 @@ Returns the complete state document.
           "bundle_id": "com.apple.Terminal",
           "app_name": "Terminal",
           "title": "paneru",
+          "role": "AXWindow",
+          "subrole": "AXStandardWindow",
           "focused": true,
           "floating": false
         }
@@ -105,6 +107,8 @@ Returns only the `virtual_workspaces` array from the complete state document.
         "bundle_id": "com.apple.Terminal",
         "app_name": "Terminal",
         "title": "paneru",
+        "role": "AXWindow",
+        "subrole": "AXStandardWindow",
         "focused": true,
         "floating": false
       }
@@ -151,6 +155,8 @@ Returns only the active display, workspace, and focused-window state.
 | `bundle_id` | string | Bundle id for the owning application, or an empty string if unknown. |
 | `app_name` | string | Display name for the owning application, or an empty string if unknown. |
 | `title` | string | Window title, or an empty string if unknown. |
+| `role` | string or null | Accessibility role (e.g. `AXWindow`), or null if the window reports none. |
+| `subrole` | string or null | Accessibility subrole (e.g. `AXStandardWindow`, `AXDialog`, `AXFloatingWindow`), or null if the window reports none. |
 | `focused` | boolean | Whether this window is focused. |
 | `floating` | boolean | Whether this window is unmanaged/floating. |
 

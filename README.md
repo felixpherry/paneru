@@ -73,7 +73,8 @@ inspired by [Niri] and [PaperWM.spoon].
 - Like all non-native window managers for MacOS, Paneru requires accessibility
   access to move windows. Once it runs you may get a dialog window asking for
   permissions. Otherwise check the setting in System Settings under "Privacy &
-  Security -> Accessibility".
+  Security -> Accessibility" (or "Privacy & Security -> Device Control and Data
+  Access" on macOS 27 and later).
 
 - Check your System Settings for "Displays have separate spaces" option. It
   should be enabled - this allows Paneru to manage the workspaces independently.
@@ -189,7 +190,10 @@ quit = "ctrl + alt - q"
 
 Alternatively, the embedded Lua runtime can declare the entire configuration
 via `paneru.setup{...}`, making the TOML file optional — see the
-**[Lua Scripting Guide](./SCRIPTING.md)**:
+**[Lua Scripting Guide](./SCRIPTING.md)**.
+
+The `paneru` table is available globally in `init.lua`; `require("paneru")`
+also returns it. No separate `paneru.so` is needed for Paneru's own config.
 
 ```lua
 -- init.lua
@@ -356,6 +360,10 @@ care about, including focus changes, virtual workspace changes, window-list
 changes, title changes, and display changes. See
 [`QUERY_AND_SUBSCRIBE_FORMAT.md`](./QUERY_AND_SUBSCRIBE_FORMAT.md) for the
 full payload contract.
+
+Each window entry includes its accessibility `role` and `subrole` (e.g.
+`AXStandardWindow`, `AXDialog`), which
+[window rules](./CONFIGURATION.md#6-window-rules-windows) can also match on.
 
 #### Scripting ideas
 

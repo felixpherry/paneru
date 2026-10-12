@@ -22,7 +22,7 @@ use std::slice::from_raw_parts_mut;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use stdext::function_name;
-use tracing::{Level, debug, error, instrument, trace, warn};
+use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use crate::config::Config;
 use crate::errors::{Error, Result};
@@ -45,6 +45,7 @@ use skylight::{
     SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
     SLSWindowQueryWindows,
 };
+pub(crate) use windows::forget_enhanced_ui_state;
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
 
 #[cfg(test)]
@@ -76,8 +77,20 @@ pub fn size_from(size: CGSize) -> Size {
 }
 
 pub fn irect_from(rect: CGRect) -> IRect {
-    let mid = rect.mid();
-    IRect::from_center_size(origin_from(mid), size_from(rect.size))
+    let origin = origin_from(rect.origin);
+    IRect::from_corners(origin, origin + size_from(rect.size))
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn odd_sized_ax_frame_keeps_its_origin_and_size() {
+        let frame = CGRect::new(CGPoint::new(0.0, 20.0), CGSize::new(399.0, 701.0));
+
+        assert_eq!(irect_from(frame), IRect::new(0, 20, 399, 721));
+    }
 }
 
 /// Defines the interface for a window manager, abstracting OS-specific operations.
@@ -387,7 +400,7 @@ impl WindowManagerApi for WindowManagerOS {
     fn get_associated_windows(&self, window_id: WinID) -> Vec<WinID> {
         trace!("for window {window_id}");
         let windows =
-            unsafe { CFRetained::retain(SLSCopyAssociatedWindows(self.main_cid, window_id)) };
+            unsafe { CFRetained::from_raw(SLSCopyAssociatedWindows(self.main_cid, window_id)) };
         windows.into_iter().filter_map(|id| id.as_i32()).collect()
     }
 
@@ -866,43 +879,47 @@ pub fn bruteforce_windows(
     // time that app starts.
     let deadline = Instant::now() + BRUTEFORCE_BUDGET;
 
-    for element_id in 0..0x7fffu64 {
-        // Every iteration is a synchronous cross-process AX round trip.
-        if window_list.is_empty() {
-            break;
-        }
-        // Checked periodically only: `Instant::now` can itself be a syscall.
-        if element_id.is_multiple_of(256) && Instant::now() >= deadline {
-            warn!(
-                "{pid}: giving up the brute-force scan at element {element_id} with {} window(s) \
-                 unresolved: {window_list:?}",
-                window_list.len()
-            );
-            break;
-        }
+    // `bruteforce_windows` runs on `AsyncComputeTaskPool` worker threads, which
+    // have no CFRunLoop to drain a thread-local `NSAutoreleasePool`.
+    objc2::rc::autoreleasepool(|_| {
+        for element_id in 0..0x7fffu64 {
+            // Every iteration is a synchronous cross-process AX round trip.
+            if window_list.is_empty() {
+                break;
+            }
+            // Checked periodically only: `Instant::now` can itself be a syscall.
+            if element_id.is_multiple_of(256) && Instant::now() >= deadline {
+                warn!(
+                    "{pid}: giving up the brute-force scan at element {element_id} with {} window(s) \
+                     unresolved: {window_list:?}",
+                    window_list.len()
+                );
+                break;
+            }
 
-        let bytes = element_id.to_ne_bytes();
-        data[0xc..0xc + bytes.len()].copy_from_slice(&bytes);
+            let bytes = element_id.to_ne_bytes();
+            data[0xc..0xc + bytes.len()].copy_from_slice(&bytes);
 
-        let Ok(element_ref) =
-            AXUIWrapper::retain(unsafe { _AXUIElementCreateWithRemoteToken(data_ref.as_ref()) })
-        else {
-            continue;
-        };
-        let Some(window_id) = try_ax_window_id(element_ref.as_ptr()) else {
-            continue;
-        };
+            let Ok(element_ref) = AXUIWrapper::from_retained(unsafe {
+                _AXUIElementCreateWithRemoteToken(data_ref.as_ref())
+            }) else {
+                continue;
+            };
+            let Some(window_id) = try_ax_window_id(element_ref.as_ptr()) else {
+                continue;
+            };
 
-        if let Some(index) = window_list.iter().position(|&id| id == window_id) {
-            window_list.remove(index);
-            debug!("Found window {window_id:?}");
-            if let Ok(window) = WindowOS::new_with_config(&element_ref, config, bundle_id)
-                .inspect_err(|err| warn!("{err}"))
-            {
-                found_windows.push(Window::new(Box::new(window)));
+            if let Some(index) = window_list.iter().position(|&id| id == window_id) {
+                window_list.remove(index);
+                debug!("Found window {window_id:?}");
+                if let Ok(window) = WindowOS::new_with_config(&element_ref, config, bundle_id)
+                    .inspect_err(|err| warn!("{err}"))
+                {
+                    found_windows.push(Window::new(Box::new(window)));
+                }
             }
         }
-    }
+    });
     found_windows
 }
 
@@ -928,6 +945,39 @@ pub fn request_ax_privilege() -> bool {
         let values = [kCFBooleanTrue.unwrap()];
         let opts = CFDictionary::from_slices(&keys, &values);
         AXIsProcessTrustedWithOptions((&raw const *opts).cast())
+    }
+}
+
+/// Resets the TCC Accessibility entry for Paneru (`com.github.karinushka.paneru`).
+///
+/// Rebuilding the binary or switching between Homebrew and Cargo changes the
+/// ad-hoc code-signing hash (`cdhash`), leaving a stale TCC entry that
+/// prevents macOS from honoring the existing toggle or re-displaying the
+/// system prompt until the entry is cleared.
+pub fn reset_ax_privilege() -> bool {
+    match std::process::Command::new("/usr/bin/tccutil")
+        .args(["reset", "Accessibility", crate::platform::service::ID])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            info!(
+                bundle_id = crate::platform::service::ID,
+                "reset TCC Accessibility entry"
+            );
+            true
+        }
+        Ok(output) => {
+            warn!(
+                status = %output.status,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "tccutil reset Accessibility failed"
+            );
+            false
+        }
+        Err(error) => {
+            warn!(%error, "unable to run tccutil to reset Accessibility entry");
+            false
+        }
     }
 }
 

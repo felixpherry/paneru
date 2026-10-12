@@ -3,12 +3,15 @@
 //! Every request is a [`Request`] and every answer a [`Response`]; these two
 //! enums are the whole protocol and the wire encoding is generated from them.
 //!
-//! Values travel as postcard — compact, binary, and not self-describing, which
-//! is why [`crate::script_value::ScriptValue`] exists in place of
-//! `serde_json::Value`. JSON is still what `paneru query` prints to a terminal,
-//! but it is not what the two processes speak to each other.
+//! Values travel as `MessagePack` with named struct fields. JSON is still what
+//! `paneru query` prints to a terminal, but it is not what the two processes
+//! speak to each other.
 
+use async_mach_ports::Result;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+pub use async_mach_ports::{Codec, Error, RecvPort, SendPort};
 
 /// The Mach service name the daemon publishes and clients look up.
 ///
@@ -27,13 +30,61 @@ pub fn service_name() -> String {
     std::env::var(SERVICE_ENV).unwrap_or_else(|_| SERVICE_NAME.to_string())
 }
 
-use crate::commands::Command;
-pub use crate::script_state::WriteOutcome;
+/// The wire format: `MessagePack`, with struct fields written as names.
+///
+/// `rmp_serde::to_vec` would write a struct as a bare positional array, which
+/// gives up everything this choice is for. `to_vec_named` is the whole point.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MessagePack;
 
-use crate::script_state::ScriptStateWrite;
-use crate::script_value::ScriptValue;
-use crate::state::{ActiveState, QueryState, StateQueryKind, VirtualWorkspaceState, WindowState};
-use crate::windowset::{LayoutOp, WindowSet};
+impl async_mach_ports::Codec for MessagePack {
+    fn encode<T: Serialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>> {
+        rmp_serde::to_vec_named(value).map_err(|_| Error::Encode)
+    }
+
+    fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T> {
+        rmp_serde::from_slice(bytes).map_err(|_| Error::Decode)
+    }
+}
+
+/// The client end of the daemon's service.
+pub type Sender<T> = async_mach_ports::Sender<T, MessagePack>;
+/// The daemon end of its service, and the client end of an event subscription.
+pub type Receiver<T> = async_mach_ports::Receiver<T, MessagePack>;
+/// One value off the wire, with whatever channels the sender attached.
+pub type Delivery<T> = async_mach_ports::Delivery<T, MessagePack>;
+/// The one-shot answer to a request.
+pub type Reply = async_mach_ports::Reply<MessagePack>;
+/// A lasting channel to a client that asked for events.
+pub type Subscriber = async_mach_ports::Subscriber<MessagePack>;
+
+/// Connects to a service as a client.
+///
+/// # Errors
+///
+/// Returns [`Error::NotRunning`] when no daemon holds the name.
+pub fn connect<T: Serialize>(service: &str) -> Result<Sender<T>> {
+    async_mach_ports::Sender::connect(service, MessagePack)
+}
+
+/// Claims a service name as its server.
+///
+/// # Errors
+///
+/// Returns an error when the name is already held.
+pub fn bind<T: DeserializeOwned>(service: &str) -> Result<Receiver<T>> {
+    async_mach_ports::Receiver::bind(service, MessagePack)
+}
+
+use crate::types::commands::Command;
+pub use crate::types::script_state::WriteOutcome;
+
+use crate::types::script_state::ScriptStateWrite;
+use crate::types::script_value::ScriptValue;
+use crate::types::state::{
+    ActiveState, QueryState, StateQueryKind, VirtualWorkspaceState, WindowState,
+};
+use crate::types::windowset::{LayoutOp, WindowSet};
 
 /// Something a client asks the daemon to do.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -115,16 +166,16 @@ pub enum ScriptStateResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{Command, Direction, Operation};
-    use crate::state::Frame;
+    use crate::types::commands::{Command, Direction, Operation};
+    use crate::types::state::Frame;
     use std::sync::Arc;
 
     fn round_trip<T>(value: &T)
     where
         T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
     {
-        let bytes = postcard::to_allocvec(value).expect("encodes");
-        let decoded: T = postcard::from_bytes(&bytes).expect("decodes");
+        let bytes = MessagePack.encode(value).expect("encodes");
+        let decoded: T = MessagePack.decode(&bytes).expect("decodes");
         assert_eq!(&decoded, value);
     }
 
@@ -165,13 +216,15 @@ mod tests {
     /// a client actually transforms, so it gets its own round trip.
     #[test]
     fn the_window_set_survives_the_wire() {
-        use crate::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
+        use crate::types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
 
         let window = |id| WindowRec {
             id,
             app_name: "Test App".to_string(),
             bundle_id: "com.example.test".to_string(),
             title: format!("Window {id}"),
+            role: Some("AXWindow".to_string()),
+            subrole: Some("AXStandardWindow".to_string()),
             frame: Some(Frame {
                 x: 0,
                 y: 0,
@@ -207,8 +260,10 @@ mod tests {
             Some(1),
         );
 
-        let bytes = postcard::to_allocvec(&Response::WindowSet(Box::new(set))).expect("encodes");
-        let Response::WindowSet(decoded) = postcard::from_bytes(&bytes).expect("decodes") else {
+        let bytes = MessagePack
+            .encode(&Response::WindowSet(Box::new(set)))
+            .expect("encodes");
+        let Response::WindowSet(decoded) = MessagePack.decode(&bytes).expect("decodes") else {
             panic!("expected a window set");
         };
 
@@ -216,15 +271,16 @@ mod tests {
         assert_eq!(decoded.east(1), Some(2));
         // Ops are deliberately not carried: a set off the wire is one nothing
         // has been asked of yet.
-        assert!(decoded.ops().is_empty());
+        assert_eq!(decoded.ops(), []);
     }
 
     #[test]
     fn a_request_is_small() {
-        let bytes =
-            postcard::to_allocvec(&Request::Query(StateQueryKind::Active)).expect("encodes");
+        let bytes = MessagePack
+            .encode(&Request::Query(StateQueryKind::Active))
+            .expect("encodes");
         assert!(
-            bytes.len() <= 4,
+            bytes.len() <= 32,
             "a query request took {} bytes",
             bytes.len()
         );

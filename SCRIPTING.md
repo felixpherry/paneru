@@ -20,6 +20,12 @@ By default, Paneru looks for a Lua script in the following locations (in order):
 
 Like the TOML config, the script is automatically reloaded when the file is saved.
 
+Paneru provides the `paneru` table as a global in `init.lua`. You can also write
+`local paneru = require("paneru")` there; it returns the same embedded API and
+does not need a separate `paneru.so` file. The loadable `paneru.so` client module
+is only for Lua scripts run outside Paneru. Installing the Paneru executable
+with `cargo install` does not install that separate module.
+
 ```lua
 paneru.on("window_focused", function(event, ws)
   paneru.run("window balance")
@@ -72,6 +78,21 @@ paneru.setup {
 }
 ```
 
+### Reading the Active Configuration (`paneru.config`)
+
+The active configuration is exposed on `paneru.config`, mirroring the `paneru.setup` schema (`paneru.config.options`, `paneru.config.padding`, `paneru.config.swipe`, `paneru.config.decorations`, `paneru.config.restore`, `paneru.config.windows`, and `paneru.config.default_workspaces`).
+
+- **Pre-populated with defaults:** Even before (or without) calling `paneru.setup`, `paneru.config` is populated with Paneru's built-in defaults (e.g., `paneru.config.options.sliver_width == 5`, `paneru.config.options.preset_column_widths`, etc.).
+- **Merged on `paneru.setup`:** Calling `paneru.setup{...}` merges your configuration table over the resolved defaults (and preserves any extra custom keys you include in the table).
+- **Read-only snapshot semantics:** `paneru.config` is a plain Lua table for inspection by snippets and callbacks. Mutating fields on `paneru.config` directly does **not** change the running window manager's settings unless you pass the modified table back to `paneru.setup(paneru.config)`.
+
+```lua
+paneru.bind("alt - i", function()
+  local widths = paneru.config.options.preset_column_widths
+  paneru.flash("Configured sliver width: " .. tostring(paneru.config.options.sliver_width))
+end)
+```
+
 ### Precedence & Reloading
 
 An `init.lua` disables the TOML entirely, whether or not it calls `paneru.setup`. With `setup`, that table is the configuration; without it, the built-in defaults are used — never a `paneru.toml` sitting next to the script. To keep using TOML, do not create a script.
@@ -82,6 +103,7 @@ Editing and saving `init.lua` hot-reloads the whole configuration (including men
 - Float-valued options (`animation_speed`, border `width`/`opacity`, window `width`, …) should be written with a decimal point (`12.0`, not `12`).
 - A reload that *removes* a previous `paneru.setup` call keeps the last config it produced rather than reverting to TOML.
 - With Nix modules, set `services.paneru.config` to this `init.lua` (Lua source or a path). See [`nix/README.md`](nix/README.md).
+
 
 ---
 
@@ -124,7 +146,7 @@ end)
 
 | Event Name | Description | Event Payload Fields |
 | --- | --- | --- |
-| `window_spawned` | A window was fully spawned and initialized in Paneru | `type`, `window_id`, `pid`, `app_name`, `bundle_id`, `title`, `frame` (`{x, y, width, height}`), `floating`, `managed` |
+| `window_spawned` | A window was fully spawned and initialized in Paneru | `type`, `window_id`, `pid`, `app_name`, `bundle_id`, `title`, `role`, `subrole`, `frame` (`{x, y, width, height}`), `floating`, `managed` |
 | `window_focused` | A window gained focus | `type`, `window_id` |
 | `window_destroyed` | A window was closed / destroyed | `type`, `window_id` |
 | `window_moved` | A window was moved | `type`, `window_id` |
@@ -166,7 +188,14 @@ end)
 | `paneru.query_workspaces()` | the virtual workspace rows |
 | `paneru.query_on_screen()` | the windows currently visible |
 
-These are spelled exactly as in the loadable client module (`require("paneru")`, see [`crates/lua`](crates/lua)), so a helper that reads state works unchanged in either host. The payloads are documented in [`QUERY_AND_SUBSCRIBE_FORMAT.md`](QUERY_AND_SUBSCRIBE_FORMAT.md).
+These are spelled exactly as in the loadable client module (`require("paneru")`, implemented in [`src/lua/client.rs`](src/lua/client.rs)), so a helper that reads state works unchanged in either host. The payloads are documented in [`QUERY_AND_SUBSCRIBE_FORMAT.md`](QUERY_AND_SUBSCRIBE_FORMAT.md).
+
+To build the standalone loadable `paneru.so` shared library for an external Lua interpreter (e.g. Lua 5.4 or LuaJIT):
+
+```sh
+cargo build --release --lib --no-default-features --features module,lua54
+ln -sf target/release/libpaneru.dylib paneru.so
+```
 
 State is gathered on demand and at most once per callback, so handlers that never query cost nothing extra. Outside a callback there is no window-manager state to read, so calling one of these at script top level raises an error; call them inside a handler or keybinding callback.
 
@@ -240,9 +269,9 @@ A handler that raises partway through changes nothing either, because it never r
 | `ws:east(id)` / `ws:west(id)` | The window one column over |
 | `ws:next(id)` / `ws:prev(id)` | The next/previous window, wrapping |
 
-A window record contains `id`, `app_name`, `bundle_id`, `title`, `frame`, `floating`, `managed`, `visible` and `focused`.
+A window record contains `id`, `app_name`, `bundle_id`, `title`, `role`, `subrole`, `frame`, `floating`, `managed`, `visible` and `focused`.
 
-`paneru.match{ app = …, bundle = …, title = …, floating = …, managed = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions.
+`paneru.match{ app = …, bundle = …, title = …, role = …, subrole = …, floating = …, managed = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions, while `role` and `subrole` match exact strings.
 
 ### Transforming Layout State
 

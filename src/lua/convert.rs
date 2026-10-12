@@ -96,7 +96,9 @@ pub struct WindowSpawnPayload {
     pub app_name: String,
     pub bundle_id: String,
     pub title: String,
-    pub frame: paneru_shared_types::state::Frame,
+    pub frame: crate::types::state::Frame,
+    pub role: Option<String>,
+    pub subrole: Option<String>,
     pub floating: bool,
     pub managed: bool,
 }
@@ -134,6 +136,8 @@ impl TryFrom<&Event> for LuaEvent {
                 app_name,
                 bundle_id,
                 title,
+                role,
+                subrole,
                 frame,
                 floating,
                 managed,
@@ -143,6 +147,8 @@ impl TryFrom<&Event> for LuaEvent {
                 app_name: app_name.clone(),
                 bundle_id: bundle_id.clone(),
                 title: title.clone(),
+                role: role.clone(),
+                subrole: subrole.clone(),
                 frame: *frame,
                 floating: *floating,
                 managed: *managed,
@@ -317,18 +323,73 @@ impl LuaEvent {
     pub fn is_known(name: &str) -> bool {
         Self::NAMES.contains(&name)
     }
+
+    /// The `paneru.on` event name for this variant (matching its serde `type` tag).
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Exit => "exit",
+            Self::ProcessesLoaded => "processes_loaded",
+            Self::ApplicationActivated { .. } => "application_activated",
+            Self::ApplicationDeactivated { .. } => "application_deactivated",
+            Self::ApplicationVisible { .. } => "application_visible",
+            Self::ApplicationHidden { .. } => "application_hidden",
+            Self::WindowSpawned(_) => "window_spawned",
+            Self::WindowDestroyed { .. } => "window_destroyed",
+            Self::WindowFocused { .. } => "window_focused",
+            Self::WindowMoved { .. } => "window_moved",
+            Self::WindowResized { .. } => "window_resized",
+            Self::WindowMinimized { .. } => "window_minimized",
+            Self::WindowDeminimized { .. } => "window_deminimized",
+            Self::WindowTitleChanged { .. } => "window_title_changed",
+            Self::MouseDown(_) => "mouse_down",
+            Self::MouseUp(_) => "mouse_up",
+            Self::MouseDragged(_) => "mouse_dragged",
+            Self::MouseMoved(_) => "mouse_moved",
+            Self::Swipe { .. } => "swipe",
+            Self::VerticalSwipe { .. } => "vertical_swipe",
+            Self::VerticalScrollTick { .. } => "vertical_scroll_tick",
+            Self::Scroll { .. } => "scroll",
+            Self::TouchpadDown => "touchpad_down",
+            Self::TouchpadUp => "touchpad_up",
+            Self::SpaceCreated { .. } => "space_created",
+            Self::SpaceDestroyed { .. } => "space_destroyed",
+            Self::SpaceChanged => "space_changed",
+            Self::DisplayAdded { .. } => "display_added",
+            Self::DisplayRemoved { .. } => "display_removed",
+            Self::DisplayMoved { .. } => "display_moved",
+            Self::DisplayResized { .. } => "display_resized",
+            Self::DisplayConfigured { .. } => "display_configured",
+            Self::DisplayChanged => "display_changed",
+            Self::MissionControlShowAllWindows => "mission_control_show_all_windows",
+            Self::MissionControlShowFrontWindows => "mission_control_show_front_windows",
+            Self::MissionControlShowDesktop => "mission_control_show_desktop",
+            Self::MissionControlExit => "mission_control_exit",
+            Self::MenuOpened { .. } => "menu_opened",
+            Self::MenuClosed { .. } => "menu_closed",
+            Self::DockDidChangePref { .. } => "dock_did_change_pref",
+            Self::DockDidRestart { .. } => "dock_did_restart",
+            Self::MenuBarHiddenChanged { .. } => "menu_bar_hidden_changed",
+            Self::SystemWoke { .. } => "system_woke",
+            Self::ThemeChanged => "theme_changed",
+        }
+    }
+
+    /// Bit position in the 64-bit subscribed-events mask for `name`, or `0` if
+    /// `name` is unknown.
+    pub fn bit_for_name(name: &str) -> u64 {
+        const { assert!(Self::NAMES.len() <= u64::BITS as usize) };
+        Self::NAMES
+            .iter()
+            .position(|&known| known == name)
+            .map_or(0, |idx| 1u64 << idx)
+    }
 }
 
 /// Marshals an already-extracted [`LuaEvent`] into `(name, table)` for dispatch
 /// to `paneru.on` callbacks.
-///
-/// The dispatch name is the serde tag serde already wrote into the table's
-/// `type` field, so there is no second hand-written variant→name mapping to
-/// keep in step with it.
 pub fn event_table(lua: &Lua, event: &LuaEvent) -> Option<(String, Table)> {
     let table = lua.to_value(event).ok()?.as_table().cloned()?;
-    let name = table.get::<String>("type").ok()?;
-    Some((name, table))
+    Some((event.name().to_owned(), table))
 }
 
 /// Extracts and marshals in one step. Convenience for callers that hold both an
@@ -362,7 +423,9 @@ mod tests {
                 app_name: "test".into(),
                 bundle_id: "test".into(),
                 title: "test".into(),
-                frame: paneru_shared_types::state::Frame {
+                role: None,
+                subrole: None,
+                frame: crate::types::state::Frame {
                     x: 0,
                     y: 0,
                     width: 100,
@@ -442,10 +505,12 @@ mod tests {
         let lua = Lua::new();
         for event in every_event() {
             let name = serde_name(&lua, &event);
+            assert_eq!(event.name(), name, "LuaEvent::name drifted from serde tag");
             assert!(
                 LuaEvent::is_known(&name),
                 "{name} is emitted but rejected by paneru.on"
             );
+            assert_ne!(LuaEvent::bit_for_name(&name), 0);
         }
         assert!(!LuaEvent::is_known("window_focussed"), "typos are rejected");
     }
@@ -510,5 +575,32 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn window_spawned_carries_role_and_subrole_to_lua() {
+        let lua = Lua::new();
+        let event = Event::WindowSpawned {
+            window_id: 7,
+            pid: 1,
+            app_name: "Finder".into(),
+            bundle_id: "com.apple.finder".into(),
+            title: "Save".into(),
+            role: Some("AXWindow".into()),
+            subrole: Some("AXDialog".into()),
+            frame: crate::types::state::Frame {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            floating: true,
+            managed: true,
+        };
+
+        let (name, table) = event_to_lua(&lua, &event).expect("window_spawned reaches Lua");
+        assert_eq!(name, "window_spawned");
+        assert_eq!(table.get::<String>("role").unwrap(), "AXWindow");
+        assert_eq!(table.get::<String>("subrole").unwrap(), "AXDialog");
     }
 }

@@ -295,7 +295,7 @@ pub fn deprecated_options_in_file(path: &Path) -> Result<Vec<String>> {
 /// "focus", "east"]`), mapping the shared vocabulary crate's parse error into
 /// this crate's configuration error.
 pub fn parse_command(argv: &[&str]) -> Result<Command> {
-    paneru_shared_types::commands::parse_command(argv)
+    crate::types::commands::parse_command(argv)
         .map_err(|err| Error::InvalidConfig(format!("{}: {err}", function_name!())))
 }
 
@@ -419,19 +419,29 @@ impl Config {
             })
     }
 
-    /// Finds window properties for a given `title` and `bundle_id`.
+    /// Finds window properties for a window.
     /// It iterates through configured window parameters and returns all matching rules.
-    /// A rule matches when its bundle ID (if any) and title regex match.
+    /// A rule matches when its title regex matches and each of its bundle ID, role
+    /// and subrole (if set) equals the window's. A rule's role or subrole never
+    /// matches a window that reports none.
     ///
     /// # Arguments
     ///
     /// * `title` - The title of the window to match.
     /// * `bundle_id` - The bundle identifier of the application owning the window.
+    /// * `role` - The window's accessibility role, if it reports one.
+    /// * `subrole` - The window's accessibility subrole, if it reports one.
     ///
     /// # Returns
     ///
     /// A `Vec<WindowParams>` containing all matching window rules.
-    pub fn find_window_properties(&self, title: &str, bundle_id: &str) -> Vec<WindowParams> {
+    pub fn find_window_properties(
+        &self,
+        title: &str,
+        bundle_id: &str,
+        role: Option<&str>,
+        subrole: Option<&str>,
+    ) -> Vec<WindowParams> {
         self.inner()
             .windows
             .as_ref()
@@ -441,7 +451,12 @@ impl Config {
                     .filter(|params| {
                         let bundle_match =
                             params.bundle_id.as_ref().map(|id| id.as_str() == bundle_id);
-                        bundle_match.is_none_or(|m| m) && params.title.is_match(title)
+                        let role_match = params.role.as_deref().map(|r| Some(r) == role);
+                        let subrole_match = params.subrole.as_deref().map(|s| Some(s) == subrole);
+                        bundle_match.is_none_or(|m| m)
+                            && role_match.is_none_or(|m| m)
+                            && subrole_match.is_none_or(|m| m)
+                            && params.title.is_match(title)
                     })
                     .cloned()
                     .collect::<Vec<_>>()
@@ -766,6 +781,15 @@ impl Config {
             .and_then(|scroll| scroll.vertical_modifier)
     }
 
+    pub fn swipe_scroll_window_step(&self) -> bool {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.scroll.as_ref())
+            .and_then(|scroll| scroll.window_step)
+            .unwrap_or(false)
+    }
+
     pub fn window_dim_ratio(&self, is_dark: bool) -> Option<f32> {
         let config = self.inner();
         if config
@@ -901,6 +925,14 @@ impl Config {
         self.options()
             .dynamic_workspaces
             .is_some_and(|enabled| enabled)
+    }
+    pub fn menubar_enabled(&self) -> bool {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.enabled)
+            .is_none_or(|enabled| enabled)
     }
     pub fn menubar_orientation(&self) -> MenubarOrientation {
         self.inner()
@@ -1194,12 +1226,14 @@ impl InnerConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(rename_all = "snake_case")]
 pub enum MissingWindowBehavior {
     Ignore,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct RestoreOptions {
     pub enabled: Option<bool>,
     pub startup_grace_ms: Option<u64>,
@@ -1229,6 +1263,7 @@ pub struct OverviewOptions {
 /// `MainOptions` represents the primary configuration options for the window manager.
 /// These options control various behaviors such as mouse focus, gesture recognition, and window animation.
 #[derive(Deserialize, Clone, Debug, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct MainOptions {
     /// Enables or disables focus follows mouse behavior.
     pub focus_follows_mouse: Option<bool>,
@@ -1288,6 +1323,7 @@ pub struct MainOptions {
     pub swipe_deceleration: Option<f64>,
     /// The modifier key used for mouse-based window resizing.
     #[serde(default, deserialize_with = "deserialize_modifier")]
+    #[cfg_attr(test, serde(serialize_with = "serialize_modifier"))]
     pub mouse_resize_modifier: Option<Modifiers>,
     /// Override the system menubar height (in pixels).
     /// When set, this value is used instead of the height reported by macOS.
@@ -1393,6 +1429,71 @@ impl<'de> Deserialize<'de> for Keybinding {
     }
 }
 
+/// The initial width of a managed window, either fixed or based on the focused window.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum InitialWindowWidth {
+    Ratio(f64),
+    Mode(InitialWindowWidthMode),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialWindowWidthMode {
+    ComplementFocused,
+}
+
+impl InitialWindowWidth {
+    pub fn ratio(self, focused_ratio: Option<f64>) -> f64 {
+        match self {
+            Self::Ratio(ratio) => ratio,
+            Self::Mode(InitialWindowWidthMode::ComplementFocused) => {
+                // The first window, or one opened from an almost full-width
+                // window, should occupy the display rather than a tiny sliver.
+                let Some(ratio) = focused_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+                else {
+                    return 1.0;
+                };
+                if ratio >= 0.95 { 1.0 } else { 1.0 - ratio }
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_initial_window_width_config() {
+    let config = Config::try_from(
+        r#"
+[windows.dynamic]
+title = ".*"
+width = "complement_focused"
+"#,
+    )
+    .expect("dynamic width rule parses");
+    let width = config.find_window_properties("Window 1", "", None, None)[0]
+        .width
+        .expect("matched width rule");
+    assert_eq!(width.ratio(Some(0.25)), 0.75);
+    assert_eq!(width.ratio(Some(0.5)), 0.5);
+    assert_eq!(width.ratio(Some(0.95)), 1.0);
+    assert_eq!(width.ratio(Some(1.0)), 1.0);
+    assert_eq!(width.ratio(None), 1.0);
+
+    let config = Config::try_from(
+        r#"
+[windows.fixed]
+title = ".*"
+width = 0.5
+"#,
+    )
+    .expect("fixed width rule still parses");
+    let width = config.find_window_properties("Window 1", "", None, None)[0]
+        .width
+        .expect("matched width rule");
+    assert_eq!(width.ratio(Some(0.25)), 0.5);
+}
+
 /// `WindowParams` defines rules and properties for specific windows based on their title or bundle ID.
 /// These parameters can override default window management behavior, such as forcing a window to float or setting its initial index.
 #[derive(Clone, Debug, Deserialize)]
@@ -1402,6 +1503,11 @@ pub struct WindowParams {
     title: Regex,
     /// An optional bundle identifier to match against the application's bundle ID.
     bundle_id: Option<String>,
+    /// An optional accessibility role (e.g. `AXWindow`) the window must report exactly.
+    role: Option<String>,
+    /// An optional accessibility subrole (e.g. `AXStandardWindow`, `AXDialog`) the
+    /// window must report exactly.
+    subrole: Option<String>,
     /// If `true`, the window will be managed as a floating window (not tiled).
     pub floating: Option<bool>,
     /// If `true`, force the process/window to be managed even if macOS reports it as
@@ -1412,10 +1518,11 @@ pub struct WindowParams {
     pub vertical_padding: Option<i32>,
     pub horizontal_padding: Option<i32>,
     pub dont_focus: Option<bool>,
-    /// An optional positive initial width ratio relative to the display width.
-    /// Values above 1.0 create an oversized, horizontally scrollable window.
+    /// A positive initial width ratio relative to the display width, or
+    /// `"complement_focused"` to fill the width left by the focused window.
+    /// Fixed ratios above 1.0 create an oversized, horizontally scrollable window.
     /// Overrides the default column width when the window is first managed.
-    pub width: Option<f64>,
+    pub width: Option<InitialWindowWidth>,
     /// Grid placement for floating windows: "cols:rows:x:y:w:h".
     /// Divides the display into a grid and positions the window at the given cell/span.
     pub grid: Option<String>,
@@ -1437,6 +1544,8 @@ impl WindowParams {
         Self {
             title: Regex::new(title).unwrap(),
             bundle_id,
+            role: None,
+            subrole: None,
             floating: None,
             manage: None,
             index: None,
@@ -1495,6 +1604,42 @@ where
     parse_modifiers(&s)
         .map(Some)
         .map_err(|e: Error| serde::de::Error::custom(e.to_string()))
+}
+
+#[cfg(test)]
+#[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn serialize_modifier<S: serde::Serializer>(
+    val: &Option<Modifiers>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_some(&val.as_ref().map(Modifiers::bits))
+}
+
+#[cfg(feature = "lua")]
+pub(crate) fn format_modifiers(modifiers: Modifiers) -> String {
+    let mut rem = modifiers;
+    let mut parts = Vec::new();
+    for (mask, name) in [
+        (Modifiers::ALT, "alt"),
+        (Modifiers::LALT, "lalt"),
+        (Modifiers::RALT, "ralt"),
+        (Modifiers::SHIFT, "shift"),
+        (Modifiers::LSHIFT, "lshift"),
+        (Modifiers::RSHIFT, "rshift"),
+        (Modifiers::CMD, "cmd"),
+        (Modifiers::LCMD, "lcmd"),
+        (Modifiers::RCMD, "rcmd"),
+        (Modifiers::CTRL, "ctrl"),
+        (Modifiers::LCTRL, "lctrl"),
+        (Modifiers::RCTRL, "rctrl"),
+        (Modifiers::FN, "fn"),
+    ] {
+        if rem.contains(mask) {
+            parts.push(name);
+            rem.remove(mask);
+        }
+    }
+    parts.join(" + ")
 }
 
 /// Builds a [`Config`] from the Lua table passed to `paneru.setup{...}`,
@@ -2076,7 +2221,8 @@ index = 1
         Some(Command::Window(Operation::Resize(ResizeDirection::Shrink)))
     ));
 
-    let props = config.find_window_properties("picture in picture", "com.something.apple");
+    let props =
+        config.find_window_properties("picture in picture", "com.something.apple", None, None);
     assert_eq!(props[0].floating, Some(true));
     assert_eq!(props[0].index, Some(1));
 
@@ -2239,6 +2385,8 @@ fn test_grid_ratios() {
     let make = |grid: Option<&str>| WindowParams {
         title: Regex::new(".*").unwrap(),
         bundle_id: None,
+        role: None,
+        subrole: None,
         floating: None,
         manage: None,
         index: None,
@@ -2333,8 +2481,40 @@ fn test_config_defaults() {
     assert_eq!(config.border_color(), (1.0, 1.0, 1.0));
     assert_eq!(config.border_opacity(), 1.0);
     assert_eq!(config.border_width(), 2.0);
-    assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
+    // Automatic radius detection is only enabled on macOS 26; other
+    // releases use the fixed-radius fallback.
+    let expected_radius = if macos_major_version() == 26 {
+        BorderRadiusOption::Auto
+    } else {
+        BorderRadiusOption::Value(10.0)
+    };
+    assert_eq!(config.border_radius(), expected_radius);
     assert_eq!(config.menubar_height(), None);
+    assert!(config.menubar_enabled());
+}
+
+#[test]
+fn test_menubar_enabled_is_independent_of_workspace_indicator() {
+    for menu_options in [
+        "",
+        "[decorations.menu]\n",
+        "[decorations.menu]\nenabled = true",
+    ] {
+        let config = Config::try_from(
+            format!(
+                "[options]\n[bindings]\n[decorations]\nworkspace_menu_status = false\n{menu_options}"
+            )
+            .as_str(),
+        )
+        .expect("config should parse");
+        assert!(config.menubar_enabled());
+        assert!(!config.workspace_menu_status());
+    }
+
+    let config = Config::try_from("[options]\n[bindings]\n[decorations.menu]\nenabled = false")
+        .expect("config should parse");
+    assert!(!config.menubar_enabled());
+    assert!(config.workspace_menu_status());
 }
 
 #[test]
@@ -2392,14 +2572,137 @@ floating = true
     let config = Config::try_from(input).expect("config should parse");
 
     // Main window should match the manage rule.
-    let props = config.find_window_properties("BetterTouchTool", "com.hegenberg.BetterTouchTool");
+    let props = config.find_window_properties(
+        "BetterTouchTool",
+        "com.hegenberg.BetterTouchTool",
+        None,
+        None,
+    );
     assert_eq!(props.len(), 1);
     assert_eq!(props[0].manage, Some(true));
 
     // Screenshot window matches the floating rule.
-    let props = config.find_window_properties("Screenshot 1", "com.hegenberg.BetterTouchTool");
+    let props =
+        config.find_window_properties("Screenshot 1", "com.hegenberg.BetterTouchTool", None, None);
     assert_eq!(props.len(), 1);
     assert_eq!(props[0].floating, Some(true));
+}
+
+#[test]
+fn test_window_rules_match_role_and_subrole() {
+    let input = r#"
+[options]
+
+[bindings]
+
+[windows.dialogs]
+title = ".*"
+subrole = "AXDialog"
+floating = true
+
+[windows.sheets]
+title = ".*"
+role = "AXSheet"
+index = 3
+
+[windows.app_standard]
+bundle_id = "com.example.app"
+title = ".*"
+role = "AXWindow"
+subrole = "AXStandardWindow"
+width = 0.5
+
+[windows.plain]
+bundle_id = "com.example.plain"
+title = ".*"
+dont_focus = true
+"#;
+    let config = Config::try_from(input).expect("config should parse");
+    let matched = |title, bundle_id, role, subrole| {
+        let mut names = config
+            .find_window_properties(title, bundle_id, role, subrole)
+            .iter()
+            .map(|params| {
+                if params.floating == Some(true) {
+                    "dialogs"
+                } else if params.index == Some(3) {
+                    "sheets"
+                } else if matches!(params.width, Some(InitialWindowWidth::Ratio(0.5))) {
+                    "app_standard"
+                } else {
+                    "plain"
+                }
+            })
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    };
+
+    // A subrole-only rule matches any app's dialog, and nothing else.
+    assert_eq!(
+        matched("Save", "com.other", Some("AXWindow"), Some("AXDialog")),
+        vec!["dialogs"]
+    );
+    assert_eq!(
+        matched(
+            "Main",
+            "com.other",
+            Some("AXWindow"),
+            Some("AXStandardWindow")
+        ),
+        Vec::<&str>::new()
+    );
+    // A rule's subrole never matches a window that reports none.
+    assert_eq!(
+        matched("Save", "com.other", Some("AXWindow"), None),
+        Vec::<&str>::new()
+    );
+
+    // A role-only rule: the role must match.
+    assert_eq!(
+        matched("Sheet", "com.other", Some("AXSheet"), None),
+        vec!["sheets"]
+    );
+    assert_eq!(
+        matched("Sheet", "com.other", None, None),
+        Vec::<&str>::new()
+    );
+
+    // Role and subrole together: both must match, alongside bundle_id.
+    assert_eq!(
+        matched(
+            "Main",
+            "com.example.app",
+            Some("AXWindow"),
+            Some("AXStandardWindow")
+        ),
+        vec!["app_standard"]
+    );
+    assert_eq!(
+        matched(
+            "Save",
+            "com.example.app",
+            Some("AXWindow"),
+            Some("AXDialog")
+        ),
+        vec!["dialogs"],
+        "app_standard's subrole excludes the app's dialog"
+    );
+
+    // A rule without role/subrole matches as before, whatever the window reports.
+    assert_eq!(
+        matched("Main", "com.example.plain", None, None),
+        vec!["plain"]
+    );
+    assert_eq!(
+        matched(
+            "Save",
+            "com.example.plain",
+            Some("AXWindow"),
+            Some("AXDialog")
+        ),
+        vec!["dialogs", "plain"]
+    );
 }
 
 #[test]
@@ -2590,11 +2893,38 @@ mod lua_setup_tests {
                 windows = { term = { title = "kitty", bindings_passthrough = { "ctrl+alt-h" } } },
             }"#,
         );
-        let rules = config.find_window_properties("kitty", "");
+        let rules = config.find_window_properties("kitty", "", None, None);
         assert_eq!(rules.len(), 1);
         assert!(
             !rules[0].passthrough_keys().is_empty(),
             "passthrough chords should resolve to keycodes"
+        );
+    }
+
+    #[test]
+    fn window_rule_role_and_subrole_are_matched() {
+        let config = config_from_source(
+            r#"return {
+                windows = {
+                    dialogs = { title = ".*", subrole = "AXDialog", floating = true },
+                    sheets = { title = ".*", role = "AXSheet", index = 2 },
+                },
+            }"#,
+        );
+
+        let rules = config.find_window_properties("Save", "", Some("AXWindow"), Some("AXDialog"));
+        assert_eq!(rules.len(), 1, "only the subrole rule matches a dialog");
+        assert_eq!(rules[0].floating, Some(true));
+
+        let rules = config.find_window_properties("Sheet", "", Some("AXSheet"), None);
+        assert_eq!(rules.len(), 1, "only the role rule matches a sheet");
+        assert_eq!(rules[0].index, Some(2));
+
+        assert!(
+            config
+                .find_window_properties("Main", "", Some("AXWindow"), Some("AXStandardWindow"))
+                .is_empty(),
+            "neither rule matches a standard window"
         );
     }
 

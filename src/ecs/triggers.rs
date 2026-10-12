@@ -5,7 +5,7 @@ use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
-use bevy::ecs::system::{Commands, NonSendMut, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, NonSendMut, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use notify::event::{DataChange, MetadataKind, ModifyKind};
@@ -33,6 +33,7 @@ use crate::ecs::{
 use crate::events::{DestroySource, Event};
 use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding,
+    forget_enhanced_ui_state,
 };
 use crate::platform::WinID;
 use crate::util::{round_px, symlink_target};
@@ -41,6 +42,28 @@ use crate::util::{round_px, symlink_target};
 /// give the usable viewport a window has to be fitted into.
 type ActiveDisplayViewport<'w, 's> =
     Single<'w, 's, (&'static Display, Option<&'static DockPosition>), With<ActiveDisplayMarker>>;
+
+type AddedWindowDefaults<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        &'static mut Position,
+        &'static mut Bounds,
+        &'static mut WidthRatio,
+        &'static ChildOf,
+    ),
+    Added<Window>,
+>;
+
+type WindowDefaultsQueries<'w, 's> = ParamSet<
+    'w,
+    's,
+    (
+        AddedWindowDefaults<'static, 'static>,
+        Query<'static, 'static, &'static WidthRatio, With<FocusedMarker>>,
+    ),
+>;
 
 /// Computes the passthrough keybinding set for the given window/app and
 /// publishes it to the input thread. Called on focus change and config reload.
@@ -263,6 +286,12 @@ pub(super) fn window_focused_trigger(
 ) {
     const STRAY_FOCUS_RETRY_SEC: u64 = 2;
 
+    let initial_focused = ctx
+        .windows
+        .focused()
+        .map(|(window, entity)| (entity, window.id()));
+    let mut current_focused = initial_focused;
+
     for event in messages.read() {
         let Event::WindowFocused { window_id } = *event else {
             continue;
@@ -352,10 +381,7 @@ pub(super) fn window_focused_trigger(
         // remain stale from a previously focused window.
         update_passthrough(window, app, &ctx.config);
 
-        let already_focused = ctx
-            .windows
-            .focused()
-            .is_some_and(|(focused, _)| focused.id() == window_id);
+        let already_focused = current_focused.is_some_and(|(_, id)| id == window_id);
 
         let managed = ctx
             .windows
@@ -441,10 +467,19 @@ pub(super) fn window_focused_trigger(
             continue;
         }
 
-        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-            entity_commands.try_insert(FocusedMarker);
-            debug!("window {} ({entity}) focused.", window.id());
-        }
+        current_focused = Some((entity, window_id));
+    }
+
+    // Apply `FocusedMarker` at most once for the final target in this frame's
+    // batch: queueing `try_insert(FocusedMarker)` for multiple entities in one
+    // deferred command buffer causes `maintain_focus_singleton` to queue
+    // `try_remove::<FocusedMarker>()` on both of them, stripping focus entirely.
+    if let Some((entity, window_id)) = current_focused
+        && current_focused != initial_focused
+        && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+    {
+        entity_commands.try_insert(FocusedMarker);
+        debug!("window {window_id} ({entity}) focused.");
     }
 }
 
@@ -554,10 +589,11 @@ pub(super) fn application_event_trigger(
             }
 
             Event::ApplicationTerminated { psn } => {
-                if let Some((_, entity)) = find_process(*psn)
-                    && let Ok(mut entity_commands) = commands.get_entity(entity)
-                {
-                    entity_commands.try_despawn();
+                if let Some((BProcess(process), entity)) = find_process(*psn) {
+                    forget_enhanced_ui_state(process.pid());
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_despawn();
+                    }
                 }
             }
             _ => (),
@@ -879,7 +915,7 @@ pub(super) fn window_managed_trigger(
     if ctx
         .windows
         .get(entity)
-        .is_some_and(|window| window.role().is_err())
+        .is_some_and(|window| !window.is_alive())
     {
         // The marker was removed because the windows was destroyed.
         return;
@@ -919,7 +955,9 @@ pub(super) fn window_managed_trigger(
     {
         let properties = WindowProperties::new(app, window, &ctx.config);
 
-        if let Some(width_ratio) = properties.width_ratio() {
+        // Re-managing an existing window (e.g. after un-floating it) retains
+        // its width under the dynamic rule. Fixed rules keep their old behavior.
+        if let Some(width_ratio) = properties.fixed_width_ratio() {
             let (_, pad_right, _, pad_left) = ctx.config.edge_padding();
             let padded_width = display_bounds.width() - pad_left - pad_right;
             let width = round_px(f64::from(padded_width) * width_ratio);
@@ -1032,11 +1070,11 @@ pub(super) fn window_destroyed_trigger(
         // space, so it needs confirming. A `kAXUIElementDestroyedNotification` means the AX element
         // itself has been torn down and is taken at face value: confirming it against the app is
         // not just unnecessary but actively wrong, because both signals below lag the teardown.
-        // `role()` keeps succeeding on the dead element for apps that outlive their windows, and
+        // `is_alive()` keeps succeeding on the dead element for apps that outlive their windows, and
         // the app's AX window list is still warm for a moment after the close. Re-checking them
         // raced the window back to life, leaving the entity in the strip and a permanent gap where
         // the window had been.
-        if matches!(source, DestroySource::SpaceNotification) && window.role().is_ok() {
+        if matches!(source, DestroySource::SpaceNotification) && window.is_alive() {
             debug!(
                 "Window {} still present, this was SLS workspace change.",
                 window.id()
@@ -1084,6 +1122,20 @@ fn give_away_focus(
     config: &mut GlobalState,
     commands: &mut Commands,
 ) {
+    if active_strip.is_tabbed_display(entity)
+        && let Some(sibling) = active_strip.tab_display_sibling(entity)
+    {
+        // Closing/losing focus on the active tab of a paneru-tabbed-display
+        // stack must focus the next tab, not fall through to the
+        // nearest-column search below — that search returns one
+        // representative entity per column, and this column's own entry
+        // was `entity` itself, so it would otherwise jump to an unrelated
+        // neighbouring column.
+        config.set_ffm_flag(None);
+        commands.focus_entity(sibling, true);
+        return;
+    }
+
     if active_strip.tabbed(entity) {
         // Do not give away focus for tabbed windows.
         // Remaining tab gets the focus.
@@ -1192,9 +1244,11 @@ pub(super) fn spawn_window_trigger(
         let layout_position = LayoutPosition::default();
 
         let title = window.title().unwrap_or_default();
+        let role = window.role().ok();
+        let subrole = window.subrole().ok();
         let app_name = app.name().to_string();
         let bundle_id = app.bundle_id().unwrap_or_default().clone();
-        let window_frame = paneru_shared_types::state::Frame {
+        let window_frame = crate::types::state::Frame {
             x: frame.min.x,
             y: frame.min.y,
             width: frame.width(),
@@ -1218,6 +1272,8 @@ pub(super) fn spawn_window_trigger(
             app_name,
             bundle_id,
             title,
+            role,
+            subrole,
             frame: window_frame,
             floating: false,
             managed: true,
@@ -1230,13 +1286,14 @@ pub(super) fn spawn_window_trigger(
 }
 
 pub(super) fn apply_window_defaults(
-    added: Populated<(&mut Window, &mut Position, &mut Bounds, &ChildOf), Added<Window>>,
+    mut windows: WindowDefaultsQueries,
     apps: Query<(Entity, &Application)>,
     active_display: ActiveDisplay,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
 ) {
-    for (ref mut window, mut position, mut bounds, child) in added {
+    let focused_ratio = windows.p1().single().ok().map(|ratio| ratio.0);
+    for (ref mut window, mut position, mut bounds, mut width_ratio, child) in windows.p0() {
         let Ok((_, app)) = apps.get(child.parent()) else {
             continue;
         };
@@ -1264,26 +1321,28 @@ pub(super) fn apply_window_defaults(
         let hpadding = properties.horizontal_padding();
         window.set_padding(WindowPadding::Vertical(vpadding.clamp(0, 50)));
         window.set_padding(WindowPadding::Horizontal(hpadding.clamp(0, 50)));
+        let display_width = f64::from(active_display.bounds().width());
         if let Ok(frame) = window.update_frame() {
             position.0 = frame.min;
-            bounds.0 = frame.size();
+            bounds.bypass_change_detection().0 = frame.size();
+            width_ratio.0 = f64::from(frame.width()) / display_width;
         }
 
         // Apply configured width AFTER update_frame so it isn't overwritten.
-        // Use padded display width (matching window_resize command behavior).
+        // WidthRatio and commit_window_size use the display's raw bounds.
         // Safe during init: this only resizes, it doesn't reposition, so a
         // window on an inactive display stays put.
-        if let Some(width) = properties.width_ratio() {
-            _ = window.update_frame().inspect_err(|err| error!("{err}"));
-            let bounds = active_display.actual_bounds(&config);
-            let (_, pad_right, _, pad_left) = config.edge_padding();
-            let padded_width = bounds.width() - pad_left - pad_right;
-            let new_width = round_px(f64::from(padded_width) * width);
+        if let Some(width) = properties.width_ratio(focused_ratio) {
+            let new_width = round_px(display_width * width);
             let height = window.frame().height();
             window.resize(Size::new(new_width, height));
             // Re-read the actual OS size: the app may enforce a minimum width
             // that differs from our request.
-            _ = window.update_frame().inspect_err(|err| error!("{err}"));
+            if let Ok(frame) = window.update_frame().inspect_err(|err| error!("{err}")) {
+                position.0 = frame.min;
+                bounds.bypass_change_detection().0 = frame.size();
+                width_ratio.0 = f64::from(frame.width()) / display_width;
+            }
         }
     }
 }

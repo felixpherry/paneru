@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::Frame;
+use crate::types::state::Frame;
 
 /// A window's id, as the accessibility layer reports it.
 pub type WinID = i32;
@@ -149,6 +149,11 @@ pub struct WindowRec {
     pub app_name: String,
     pub bundle_id: String,
     pub title: String,
+    /// Accessibility role (e.g. `AXWindow`), when the window reports one.
+    pub role: Option<String>,
+    /// Accessibility subrole (e.g. `AXStandardWindow`, `AXDialog`), when the
+    /// window reports one.
+    pub subrole: Option<String>,
     /// Where it is now, in global display coordinates, when known.
     pub frame: Option<Frame>,
     /// Outside the tiling layout, positioned by hand.
@@ -771,6 +776,8 @@ mod tests {
             app_name: name.to_string(),
             bundle_id: format!("com.example.{name}"),
             title: format!("{name} window"),
+            role: Some("AXWindow".to_string()),
+            subrole: Some("AXStandardWindow".to_string()),
             frame: None,
             floating: false,
             managed: true,
@@ -825,7 +832,7 @@ mod tests {
     #[test]
     fn a_fresh_window_set_has_asked_for_nothing() {
         let set = fixture();
-        assert!(set.ops().is_empty());
+        assert_eq!(set.ops(), []);
         assert!(!set.is_transformed());
     }
 
@@ -878,7 +885,7 @@ mod tests {
 
         assert_eq!(left.ops(), vec![LayoutOp::Focus(2)]);
         assert_eq!(right.ops(), vec![LayoutOp::Focus(3)]);
-        assert!(base.ops().is_empty());
+        assert_eq!(base.ops(), []);
         assert_eq!(base.focused(), Some(1));
     }
 

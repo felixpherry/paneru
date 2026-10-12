@@ -490,7 +490,7 @@ fn restore_plan_skips_ambiguous_fallback_match() {
 
     let plan = RestorePlanner::new(&state).plan(&current, &live_spaces());
 
-    assert!(plan.strips.is_empty());
+    assert_eq!(plan.strips, []);
     assert!(plan.active_virtual_by_workspace.is_empty());
     assert!(plan.consumed_entities.is_empty());
     assert_eq!(plan.ignored_missing_windows, 0);
@@ -609,9 +609,9 @@ fn test_query_state_contract_exposes_active_virtual_workspace_and_windows() {
     assert_eq!(state.virtual_workspaces[0].windows[0].bundle_id, "test");
     assert!(state.virtual_workspaces[0].windows[0].focused);
     assert_eq!(state.virtual_workspaces[1].number, 2);
-    assert!(state.virtual_workspaces[1].windows.is_empty());
+    assert_eq!(state.virtual_workspaces[1].windows, []);
     assert_eq!(state.virtual_workspaces[2].number, 3);
-    assert!(state.virtual_workspaces[2].windows.is_empty());
+    assert_eq!(state.virtual_workspaces[2].windows, []);
 
     let json = serde_json::to_value(&state).expect("query state should serialize");
     assert_eq!(json["active"]["virtual_workspace_number"], 1);
@@ -619,6 +619,49 @@ fn test_query_state_contract_exposes_active_virtual_workspace_and_windows() {
         json["virtual_workspaces"][0]["windows"][0]["bundle_id"],
         "test"
     );
+}
+
+#[test]
+fn test_query_state_exposes_window_role_and_subrole() {
+    use crate::tests::harness::TestHarness;
+
+    let mut harness = TestHarness::new()
+        .with_windows(1)
+        .with_window(1, |window| window.subrole = "AXDialog".to_string())
+        // An empty mock subrole models a window without an `AXSubrole` attribute.
+        .with_window(2, |window| window.subrole = String::new());
+
+    harness.app.update();
+
+    let state = extract_query_state(harness.world()).expect("query state extraction");
+    let windows = &state.virtual_workspaces[0].windows;
+    let window = |id| {
+        windows
+            .iter()
+            .find(|window| window.window_id == id)
+            .unwrap_or_else(|| panic!("window {id} missing from query state"))
+    };
+
+    assert_eq!(window(0).role.as_deref(), Some("AXWindow"));
+    assert_eq!(window(0).subrole.as_deref(), Some("AXStandardWindow"));
+    assert_eq!(window(1).role.as_deref(), Some("AXWindow"));
+    assert_eq!(window(1).subrole.as_deref(), Some("AXDialog"));
+    assert_eq!(window(2).role.as_deref(), Some("AXWindow"));
+    assert_eq!(window(2).subrole, None);
+
+    let json = serde_json::to_value(&state).expect("query state should serialize");
+    let json_window = |id: i32| {
+        json["virtual_workspaces"][0]["windows"]
+            .as_array()
+            .expect("windows array")
+            .iter()
+            .find(|window| window["window_id"] == id)
+            .unwrap_or_else(|| panic!("window {id} missing from JSON"))
+            .clone()
+    };
+    assert_eq!(json_window(1)["role"], "AXWindow");
+    assert_eq!(json_window(1)["subrole"], "AXDialog");
+    assert!(json_window(2)["subrole"].is_null());
 }
 
 #[test]
@@ -803,7 +846,7 @@ fn test_query_state_tracks_float_after_virtual_workspace_is_reaped() {
                 .find(|workspace| workspace.native_workspace_id == TEST_WORKSPACE_ID + 1)
                 .expect("live native workspace");
 
-            assert!(original_workspace.windows.is_empty());
+            assert_eq!(original_workspace.windows, []);
             assert_eq!(live_workspace.windows.len(), 1);
             assert!(live_workspace.windows[0].floating);
         })
@@ -814,7 +857,7 @@ fn test_query_state_tracks_float_after_virtual_workspace_is_reaped() {
 #[cfg(feature = "lua")]
 fn extract_window_set(
     world: &mut World,
-) -> crate::errors::Result<paneru_shared_types::windowset::WindowSet> {
+) -> crate::errors::Result<crate::types::windowset::WindowSet> {
     use crate::ecs::state::QueryStateParams;
 
     let mut system_state: SystemState<QueryStateParams> = SystemState::new(world);
@@ -826,7 +869,7 @@ fn extract_window_set(
 #[test]
 fn test_window_set_keeps_the_column_structure_a_flat_query_loses() {
     use crate::tests::harness::TestHarness;
-    use paneru_shared_types::windowset::ColumnKind;
+    use crate::types::windowset::ColumnKind;
 
     let mut harness = TestHarness::new().with_windows(3);
     harness.app.update();
@@ -915,7 +958,7 @@ fn test_window_set_marks_floating_windows_outside_the_strip() {
 fn test_layout_ops_apply_to_the_named_window_not_the_focused_one() {
     use crate::commands::Command;
     use crate::tests::harness::TestHarness;
-    use paneru_shared_types::windowset::LayoutOp;
+    use crate::types::windowset::LayoutOp;
 
     let mut harness = TestHarness::new().with_windows(3);
     harness.app.update();
@@ -961,7 +1004,7 @@ fn test_layout_ops_apply_to_the_named_window_not_the_focused_one() {
 fn test_layout_ops_skip_a_vanished_window_and_apply_its_neighbours() {
     use crate::commands::Command;
     use crate::tests::harness::TestHarness;
-    use paneru_shared_types::windowset::LayoutOp;
+    use crate::types::windowset::LayoutOp;
 
     let mut harness = TestHarness::new().with_windows(2);
     harness.app.update();
@@ -998,8 +1041,8 @@ fn test_layout_ops_skip_a_vanished_window_and_apply_its_neighbours() {
 fn test_set_frame_places_a_floating_window() {
     use crate::commands::Command;
     use crate::tests::harness::TestHarness;
-    use paneru_shared_types::state::Frame;
-    use paneru_shared_types::windowset::LayoutOp;
+    use crate::types::state::Frame;
+    use crate::types::windowset::LayoutOp;
 
     let mut harness = TestHarness::new().with_windows(1);
     // Let the window settle into the strip first: a window still being added

@@ -117,6 +117,11 @@ pub struct WindowState {
     pub bundle_id: String,
     pub app_name: String,
     pub title: String,
+    /// Accessibility role (e.g. `AXWindow`), when the window reports one.
+    pub role: Option<String>,
+    /// Accessibility subrole (e.g. `AXStandardWindow`, `AXDialog`), when the
+    /// window reports one.
+    pub subrole: Option<String>,
     pub focused: bool,
     pub floating: bool,
     /// Display the window is (mostly) on, when it overlaps one at all.
@@ -171,8 +176,8 @@ impl QueryState {
     /// This is what actually crosses between processes; the two JSON spellings
     /// above are for a terminal and for the embedded Lua runtime.
     #[must_use]
-    pub fn to_query_payload(&self, kind: StateQueryKind) -> crate::wire::QueryPayload {
-        use crate::wire::QueryPayload;
+    pub fn to_query_payload(&self, kind: StateQueryKind) -> crate::types::wire::QueryPayload {
+        use crate::types::wire::QueryPayload;
         match kind {
             StateQueryKind::State => QueryPayload::State(Box::new(self.clone())),
             StateQueryKind::VirtualWorkspaces => {
@@ -247,7 +252,7 @@ impl StateEvent {
     /// If serialization fails, which should not happen barring a bug in this
     /// type's `Serialize` impl.
     pub fn to_json(&self) -> serde_json::Result<serde_json::Value> {
-        Ok(crate::json::flatten_tag(
+        Ok(crate::types::json::flatten_tag(
             serde_json::to_value(self)?,
             "event",
         ))
@@ -257,6 +262,7 @@ impl StateEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::wire::{Codec, MessagePack};
 
     #[test]
     fn query_kinds_round_trip_through_their_tokens() {
@@ -279,6 +285,8 @@ mod tests {
                 bundle_id: "com.example.app".into(),
                 app_name: "Example".into(),
                 title: "window".into(),
+                role: Some("AXWindow".into()),
+                subrole: Some("AXStandardWindow".into()),
                 focused: true,
                 floating: false,
                 display_id: Some(1),
@@ -297,12 +305,54 @@ mod tests {
         assert!(line.contains(r#""event":"on_screen_changed""#));
         assert!(line.contains(r#""windows":"#));
 
-        let bytes = postcard::to_allocvec(&event).unwrap();
+        let bytes = MessagePack.encode(&event).unwrap();
         assert_eq!(
-            postcard::from_bytes::<StateEvent>(&bytes).unwrap(),
+            MessagePack.decode::<StateEvent>(&bytes).unwrap(),
             event,
             "clients must decode exactly what the daemon emits"
         );
+    }
+
+    /// A daemon from before `role`/`subrole` existed omits them; a newer client
+    /// must still decode its windows, over both JSON and `MessagePack`.
+    #[test]
+    fn window_state_without_role_fields_decodes_as_none() {
+        #[derive(Serialize)]
+        struct OldWindowState {
+            window_id: i32,
+            bundle_id: String,
+            app_name: String,
+            title: String,
+            focused: bool,
+            floating: bool,
+            display_id: Option<u32>,
+            frame: Option<Frame>,
+            visible: bool,
+        }
+        let old = OldWindowState {
+            window_id: 1,
+            bundle_id: "com.example.app".into(),
+            app_name: "Example".into(),
+            title: "window".into(),
+            focused: true,
+            floating: false,
+            display_id: Some(1),
+            frame: None,
+            visible: true,
+        };
+
+        let from_json: WindowState =
+            serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        let from_msgpack: WindowState = MessagePack
+            .decode(&MessagePack.encode(&old).unwrap())
+            .unwrap();
+
+        for window in [from_json, from_msgpack] {
+            assert_eq!(window.window_id, 1);
+            assert_eq!(window.title, "window");
+            assert_eq!(window.role, None);
+            assert_eq!(window.subrole, None);
+        }
     }
 
     #[test]
@@ -312,6 +362,8 @@ mod tests {
             bundle_id: String::new(),
             app_name: String::new(),
             title: String::new(),
+            role: None,
+            subrole: None,
             focused: false,
             floating: false,
             display_id: Some(1),

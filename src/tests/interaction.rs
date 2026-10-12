@@ -8,8 +8,8 @@ use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
-    ActiveWorkspaceMarker, FocusedMarker, ManualStripOffset, NativeFullscreenMarker, Position,
-    Unmanaged, layout::LayoutStrip,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, ManualStripOffset,
+    NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
@@ -731,6 +731,182 @@ fn test_external_focus_reactivates_hidden_virtual_strip_when_marker_is_stale() {
         .run(commands);
 }
 
+#[test]
+fn test_external_focus_switch_flashes_workspace_number() {
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(1, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).any(|message| message.0 == "2"),
+                "a Paneru workspace command should still flash the destination number"
+            );
+        })
+        .on_iteration(2, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).any(|message| message.0 == "1"),
+                "returning to workspace 1 through external focus should flash its number"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::VirtualNumber(1)),
+            },
+            Event::WindowFocused { window_id: 0 },
+        ]);
+}
+
+#[test]
+fn test_native_space_switch_flashes_workspace_number() {
+    let other_space = TEST_WORKSPACE_ID + 1;
+    TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, other_space],
+        )
+        .on_iteration(0, move |_world, state| {
+            state.activate_workspace(TEST_DISPLAY_ID, other_space, false);
+        })
+        .on_iteration(1, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).any(|message| message.0 == "1"),
+                "switching macOS Spaces should flash the selected virtual workspace number"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+        ]);
+}
+
+#[test]
+fn test_workspace_popup_uses_final_index_after_activation() {
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, |world, _state| {
+            let display = world
+                .query_filtered::<Entity, With<ActiveDisplayMarker>>()
+                .single(world)
+                .expect("active display");
+            let strip = world
+                .spawn((
+                    LayoutStrip::new(TEST_WORKSPACE_ID, 0),
+                    Position(Origin::new(0, 0)),
+                    ChildOf(display),
+                    ActiveWorkspaceMarker,
+                ))
+                .id();
+            world
+                .entity_mut(strip)
+                .get_mut::<LayoutStrip>()
+                .expect("new strip")
+                .virtual_index = 1;
+        })
+        .on_iteration(1, |world, _state| {
+            let active_index = world
+                .query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>()
+                .single(world)
+                .expect("active strip")
+                .virtual_index;
+            assert_eq!(active_index, 1);
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).any(|message| message.0 == "2"),
+                "popup should use the settled index, not the value at marker insertion"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+#[test]
+fn test_initial_workspace_does_not_flash() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.advance(Duration::from_millis(20));
+
+    let world = harness.world();
+    let mut messages = world.query::<&crate::ecs::FlashMessage>();
+    assert!(messages.iter(world).next().is_none());
+}
+
+#[test]
+fn test_workspace_popup_setting_disables_command_and_external_switch_flashes() {
+    let config = Config::try_from("[decorations]\nworkspace_popup_status = false\n[bindings]\n")
+        .expect("config should parse");
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .on_iteration(1, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).next().is_none(),
+                "the workspace command should not flash while popups are disabled"
+            );
+        })
+        .on_iteration(2, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).next().is_none(),
+                "external focus should not flash while popups are disabled"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::VirtualNumber(1)),
+            },
+            Event::WindowFocused { window_id: 0 },
+        ]);
+}
+
+#[test]
+fn test_workspace_popup_setting_disables_native_space_switch_flash() {
+    let config = Config::try_from("[decorations]\nworkspace_popup_status = false\n[bindings]\n")
+        .expect("config should parse");
+    let other_space = TEST_WORKSPACE_ID + 1;
+
+    TestHarness::new()
+        .with_config(config)
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, other_space],
+        )
+        .on_iteration(0, move |_world, state| {
+            state.activate_workspace(TEST_DISPLAY_ID, other_space, false);
+        })
+        .on_iteration(1, |world, _state| {
+            let mut messages = world.query::<&crate::ecs::FlashMessage>();
+            assert!(
+                messages.iter(world).next().is_none(),
+                "macOS Space switches should not flash while popups are disabled"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+        ]);
+}
+
 // When the focused window leaves the active strip (e.g. it just became
 // floating, or the OS handed focus to an off-strip window), window_focus
 // east/west must enter the strip from the appropriate side rather than
@@ -870,6 +1046,82 @@ fn test_stray_background_tab_is_folded_into_the_visible_tab() {
     assert_eq!(strip.len(), 1, "the stray column is gone");
     assert!(strip.tabbed(background), "the background tab is a tab now");
     assert!(strip.tabbed(leader));
+}
+
+/// Ghostty keeps every background tab in the window server's on-screen list,
+/// so "not on screen" never becomes true and the fold above cannot fire. What
+/// it does do is drop the background tab from its accessibility window list,
+/// which is the signal this leans on instead.
+#[test]
+fn test_on_screen_background_tab_is_folded_into_the_visible_tab() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    use crate::ecs::{Bounds, Position};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    for _ in 0..3 {
+        harness.app.update();
+    }
+
+    // Both windows stay on screen, exactly as the window server reports a
+    // Ghostty tab group. Only the app's accessibility list tells them apart.
+    harness.mock_state.set_background_tab(1, true);
+
+    let world = harness.app.world_mut();
+    let leader = find_window_entity(0, world);
+    let background = find_window_entity(1, world);
+    let position = world.get::<Position>(leader).expect("a position").clone();
+    let bounds = world.get::<Bounds>(leader).expect("bounds").clone();
+    world.entity_mut(background).insert((position, bounds));
+
+    {
+        let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+        let strip = strips.single(world).expect("one active strip");
+        assert_eq!(strip.len(), 2, "the tabs start out in columns of their own");
+    }
+
+    world
+        .run_system_once(crate::ecs::systems::regroup_stray_native_tabs)
+        .expect("the regrouping system runs");
+
+    let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+    let strip = strips.single(world).expect("one active strip");
+    assert_eq!(strip.len(), 1, "the stray column is gone");
+    assert!(strip.tabbed(background), "the background tab is a tab now");
+    assert!(strip.tabbed(leader));
+}
+
+/// An app that does not answer an accessibility window list query must not be
+/// read as showing nothing: every window of that app would fold into one
+/// column.
+#[test]
+fn test_silent_accessibility_list_does_not_fold_visible_windows() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    use crate::ecs::{Bounds, Position};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    for _ in 0..3 {
+        harness.app.update();
+    }
+
+    harness.mock_state.set_background_tab(0, true);
+    harness.mock_state.set_background_tab(1, true);
+
+    let world = harness.app.world_mut();
+    let leader = find_window_entity(0, world);
+    let other = find_window_entity(1, world);
+    let position = world.get::<Position>(leader).expect("a position").clone();
+    let bounds = world.get::<Bounds>(leader).expect("bounds").clone();
+    world.entity_mut(other).insert((position, bounds));
+
+    world
+        .run_system_once(crate::ecs::systems::regroup_stray_native_tabs)
+        .expect("the regrouping system runs");
+
+    let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+    let strip = strips.single(world).expect("one active strip");
+    assert_eq!(strip.len(), 2, "both windows keep their own column");
 }
 
 /// An app with native tabs answers "which window is focused?" with whichever
@@ -3614,5 +3866,75 @@ fn test_virtual_move_number_recreates_missing_baseline_row() {
         recreated,
         vec![true],
         "the moved window should land on a single recreated row 0"
+    );
+}
+
+/// Issuing a keyboard focus command to an off-edge window must compute the
+/// strip target, project all window targets against that strip target, and
+/// advance their positions on the very first `app.update()` frame (Frame 0),
+/// rather than lagging by extra frames.
+#[test]
+fn test_focus_command_starts_animation_on_first_frame() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(10.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    let initial_strip_x = {
+        let world = harness.world();
+        world
+            .query_filtered::<&Position, With<ActiveWorkspaceMarker>>()
+            .single(world)
+            .expect("active strip")
+            .x
+    };
+    let initial_win0_x = {
+        let world = harness.world();
+        let entity = find_window_entity(0, world);
+        world.get::<Position>(entity).expect("window 0 pos").x
+    };
+
+    // Issue Focus(Last) to move focus from window 0 (at index 0) to window 2
+    // (at index 2, x=800..1200, partially offscreen right), scrolling the strip on Frame 0.
+    harness
+        .app
+        .world_mut()
+        .write_message::<Event>(Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        });
+
+    // Run a single frame (Frame 0).
+    harness.app.update();
+
+    let world = harness.world();
+    let (strip_pos, strip_reposition) = world
+        .query_filtered::<(&Position, Option<&RepositionMarker>), With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active strip");
+    assert!(
+        strip_reposition.is_some(),
+        "active strip should have RepositionMarker on Frame 0"
+    );
+    assert_ne!(
+        strip_pos.x, initial_strip_x,
+        "active strip should already have advanced on Frame 0"
+    );
+
+    let win0_entity = find_window_entity(0, world);
+    let win0_pos = world.get::<Position>(win0_entity).expect("window 0 pos");
+    let win0_reposition = world.get::<RepositionMarker>(win0_entity);
+    assert!(
+        win0_reposition.is_some(),
+        "window 0 should have RepositionMarker on Frame 0"
+    );
+    assert_ne!(
+        win0_pos.x, initial_win0_x,
+        "window 0 should already have advanced on Frame 0"
     );
 }

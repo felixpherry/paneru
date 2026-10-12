@@ -3,13 +3,12 @@ use std::time::Duration;
 
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
-use bevy::app::{AppExit, First, Last, PostUpdate, PreUpdate, Startup};
+use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
-use bevy::ecs::schedule::common_conditions::{not, resource_exists};
+use bevy::ecs::schedule::common_conditions::{not, resource_changed, resource_exists};
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
@@ -22,12 +21,11 @@ use bevy::{
     ecs::{component::Component, entity::Entity, schedule::IntoScheduleConfigs},
 };
 use derive_more::{Deref, DerefMut};
-use objc2::rc::autoreleasepool;
 use tracing::{Level, error, instrument, warn};
 
 use crate::commands::register_commands;
 use crate::config::snippet::SnippetDialect;
-use crate::config::{CONFIGURATION_FILE, Config, WindowParams};
+use crate::config::{CONFIGURATION_FILE, Config, InitialWindowWidth, WindowParams};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::state::PaneruState;
 use crate::errors::Result;
@@ -37,7 +35,6 @@ use crate::lua;
 use crate::manager::{
     Application, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi, WindowManagerOS,
 };
-use crate::menubar::MenuBarManager;
 use crate::overlay::{FlashMessageManager, OverlayManager, OverviewRenderer};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
@@ -71,8 +68,8 @@ pub(crate) use triggers::apply_config_side_effects;
 /// * `app` - The Bevy application to register the systems with.
 #[allow(clippy::too_many_lines)]
 pub fn register_systems(app: &mut bevy::app::App) {
-    const CLOSED_WINDOW_CHECK_FREQ: Duration = Duration::from_millis(1000);
-    const LOW_POWER_MODE_CHECK: Duration = Duration::from_secs(60);
+    const CLOSED_WINDOW_CHECK_FREQ: Duration = Duration::from_secs(1);
+    const LOW_POWER_MODE_CHECK: Duration = Duration::from_mins(1);
     const APP_OBSERVABILITY_CHECK_FREQ: Duration = Duration::from_millis(200);
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
@@ -100,13 +97,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
         };
-    // The menu bar additionally shows how many virtual workspaces exist, so it
-    // has to redraw when one is created or reaped, neither of which touches the
-    // active strip.
-    let strip_count_changed =
-        |added: Query<(), Added<LayoutStrip>>, mut removed: RemovedComponents<LayoutStrip>| {
-            !added.is_empty() || removed.read().next().is_some()
-        };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
 
@@ -125,8 +115,11 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_systems(
         PreUpdate,
         (
-            systems::window_creation_event,
             systems::pump_events,
+            // Read creation notifications in the same frame that pumps them.
+            // Otherwise an idle pump can wait up to its next timeout before
+            // the first resize of a newly visible window.
+            systems::window_creation_event.after(systems::pump_events),
             systems::demux_input_events.after(systems::pump_events),
         ),
     );
@@ -200,8 +193,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::update_flash_messages,
             )
                 .chain(),
-            crate::menubar::update_menu_bar
-                .run_if(vw_indicator_dirty.or_eager(strip_count_changed)),
+            crate::menubar::update_menu_bar.run_if(
+                crate::menubar::menu_bar_dirty
+                    .or_eager(crate::menubar::menu_viewport_dirty)
+                    .or_eager(resource_changed::<Config>)
+                    .or_eager(resource_changed::<crate::menubar::MenuBarVisibility>),
+            ),
         ),
     );
 }
@@ -213,7 +210,9 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         (
             triggers::front_switched_trigger,
             triggers::launched_from_trigger,
-            triggers::window_focused_trigger,
+            triggers::window_focused_trigger
+                .after(triggers::apply_window_positions)
+                .before(focus::fix_window_size_on_focus),
             triggers::mission_control_trigger,
             triggers::application_event_trigger,
             triggers::dispatch_application_messages,
@@ -404,6 +403,10 @@ pub struct Timeout {
     pub timer: Timer,
     /// An optional system to execute on timeout.
     pub system_id: Option<SystemId>,
+    /// Optional custom expiry action. When `None`, the owning entity is
+    /// despawned on timeout; when `Some`, the callback runs on the entity
+    /// (e.g. removing temporary marker components without despawning the entity).
+    pub on_expire: Option<fn(&mut EntityCommands)>,
 }
 
 impl Timeout {
@@ -419,29 +422,31 @@ impl Timeout {
     ///
     /// A new `Timeout` instance.
     pub fn new(duration: Duration, message: Option<String>, commands: &mut Commands) -> Self {
-        let timer = Timer::from_seconds(duration.as_secs_f32(), bevy::time::TimerMode::Once);
-        if let Some(message) = message {
-            let callback = move || {
+        let timer = Timer::new(duration, bevy::time::TimerMode::Once);
+        let system_id = message.map(|message| {
+            commands.register_system(move || {
                 tracing::debug!("{message}");
-            };
-            let system_id = Some(commands.register_system(callback));
-
-            Self { timer, system_id }
-        } else {
-            Self {
-                timer,
-                system_id: None,
-            }
+            })
+        });
+        Self {
+            timer,
+            system_id,
+            on_expire: None,
         }
     }
 
-    /// Creates an action timeout, which oneshots a provided system id.
-    pub fn callback(duration: Duration, system_id: SystemId, commands: &mut Commands) {
-        let timer = Timer::from_seconds(duration.as_secs_f32(), bevy::time::TimerMode::Once);
-        commands.spawn(Self {
+    /// Creates a timeout attached to an existing entity that removes `Timeout`
+    /// and `C` when the timer expires instead of despawning the entity.
+    #[must_use]
+    pub fn for_component<C: Component>(duration: Duration) -> Self {
+        let timer = Timer::new(duration, bevy::time::TimerMode::Once);
+        Self {
             timer,
-            system_id: Some(system_id),
-        });
+            system_id: None,
+            on_expire: Some(|entity_commands| {
+                entity_commands.try_remove::<(Self, C)>();
+            }),
+        }
     }
 }
 
@@ -453,6 +458,12 @@ pub struct StrayFocusEvent(pub WinID);
 /// an `ApplicationFrontSwitched` event (e.g. transient `kAXErrorCannotComplete`).
 #[derive(Component)]
 pub struct RetryFrontSwitch(pub Entity);
+
+/// Marker component attached to a window after a keyboard focus request to
+/// verify whether the application accepted or rejected focus once the settle
+/// [`Timeout`] completes.
+#[derive(Component)]
+pub struct VerifyFocus;
 
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);
@@ -482,6 +493,11 @@ impl VerifyWindowPosition {
         self.remaining == 0
     }
 }
+
+/// Marker attached to windows after a display change so [`focus::fix_window_size_on_focus`]
+/// re-reads their OS frame once when focused instead of polling AX on every focus change.
+#[derive(Component)]
+pub struct VerifyWindowSize;
 
 #[derive(Deref, DerefMut, Resource)]
 pub struct LowPowerMode(pub bool);
@@ -658,16 +674,31 @@ pub(crate) fn rewatch_configs(
     Some(watcher)
 }
 
-/// Replaces `ScheduleRunnerPlugin`'s loop to give every frame its own
-/// autorelease pool. Without one, whatever `AppKit` autoreleases inside a system
-/// — the window `orderFront`/`orderOut` retain, for one — sat in the main
-/// thread's never-drained top-level pool: each overview open leaked its
-/// full-screen window and every layer under it.
-fn run_frames(mut app: BevyApp) -> AppExit {
-    app.finish();
-    app.cleanup();
+/// Runs the Bevy schedule loop with each tick wrapped in an Objective-C
+/// `NSAutoreleasePool`.
+///
+/// `MinimalPlugins`'s default `ScheduleRunnerPlugin` runs `app.update()` in a
+/// bare Rust loop with no pool. While `pump_cocoa_event_loop` wraps
+/// `nextEventMatchingMask` in its own pool, every Bevy system in `Startup`,
+/// `PreUpdate` (after the pump), `Update`, and `PostUpdate` (`OverlayManager`,
+/// `FlashMessageManager`, `MenuBarManager`, `NSScreen`, `NSWorkspace`,
+/// `CoreAnimation` `CATransaction`s) runs outside that pool and would otherwise
+/// push autoreleased objects into the root pool for the lifetime of the daemon.
+fn autorelease_runner(mut app: BevyApp) -> bevy::app::AppExit {
+    if app.plugins_state() != bevy::app::PluginsState::Cleaned {
+        while app.plugins_state() == bevy::app::PluginsState::Adding {
+            bevy::tasks::tick_global_task_pools_on_main_thread();
+        }
+        objc2::rc::autoreleasepool(|_| {
+            app.finish();
+            app.cleanup();
+        });
+    }
+
     loop {
-        autoreleasepool(|_| app.update());
+        objc2::rc::autoreleasepool(|_| {
+            app.update();
+        });
         if let Some(exit) = app.should_exit() {
             return exit;
         }
@@ -713,7 +744,6 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     let mut app = BevyApp::new();
 
     app.add_plugins(MinimalPlugins)
-        .set_runner(run_frames)
         // `add_message`, not `init_resource`: the latter never registers the
         // buffer with bevy's `MessageRegistry`, so it's never double-buffered
         // and grows unbounded instead — every event lived for the process's
@@ -760,19 +790,20 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         });
     }
 
+    app.set_runner(autorelease_runner);
+
+    crate::menubar::load_menu_bar_preference(&mut app);
     let menu_events = sender.clone();
     let overview_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
-    platform_callbacks.setup_handlers()?;
+    let initial_config = platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
     let overlay_manager = OverlayManager::new(mtm);
     let flash_message_manager = FlashMessageManager::new(mtm);
-    let menu_bar_manager = MenuBarManager::new(mtm, menu_events);
     app.insert_non_send(platform_callbacks)
         .insert_non_send(overlay_manager)
         .insert_non_send(OverviewRenderer::new(mtm, overview_events))
         .insert_non_send(flash_message_manager)
-        .insert_non_send(menu_bar_manager)
         .insert_non_send(receiver);
 
     // `CONFIGURATION_FILE` is `None` exactly when an `init.lua` took the TOML
@@ -827,6 +858,8 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         app.add_plugins(lua::LuaPlugin {});
     }
 
+    crate::menubar::setup_menu_bar(&mut app, mtm, menu_events, &initial_config);
+
     Ok(app)
 }
 
@@ -838,7 +871,13 @@ impl WindowProperties {
     pub fn new(app: &Application, window: &Window, config: &Config) -> Self {
         let bundle_id = app.bundle_id().unwrap_or_default();
         let title = window.title().unwrap_or_default();
-        let params = config.find_window_properties(&title, &bundle_id);
+        // ponytail: a transient AX failure here yields None, so rules keyed on
+        // role/subrole silently miss this window and are never re-matched.
+        // Retry the match once the role becomes readable if this bites.
+        let role = window.role().ok();
+        let subrole = window.subrole().ok();
+        let params =
+            config.find_window_properties(&title, &bundle_id, role.as_deref(), subrole.as_deref());
         Self { params }
     }
 
@@ -875,8 +914,18 @@ impl WindowProperties {
             .collect::<Vec<_>>()
     }
 
-    pub fn width_ratio(&self) -> Option<f64> {
-        self.params.iter().find_map(|props| props.width)
+    pub fn width_ratio(&self, focused_ratio: Option<f64>) -> Option<f64> {
+        self.params
+            .iter()
+            .find_map(|props| props.width)
+            .map(|width| width.ratio(focused_ratio))
+    }
+
+    pub fn fixed_width_ratio(&self) -> Option<f64> {
+        match self.params.iter().find_map(|props| props.width) {
+            Some(InitialWindowWidth::Ratio(ratio)) => Some(ratio),
+            _ => None,
+        }
     }
 
     pub fn vertical_padding(&self) -> i32 {
