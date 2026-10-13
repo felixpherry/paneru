@@ -562,6 +562,66 @@ fn test_window_launched_from_binding_tiles_where_the_binding_was_pressed() {
     run_window_opened_after_display_moved(Command::Lua(1), EXT_WORKSPACE_ID);
 }
 
+/// Firefox's `--new-window` from a binding on the external display, with the
+/// new window and macOS's switch to the laptop arriving together. `spawn`:
+/// the window is tiled on the external display before the switch is handled,
+/// and the laptop's moved-window check, which still sees it on the laptop's
+/// space until its move lands, must not pull it back. Otherwise paneru finds
+/// it through the front switch. (A window adopted before it was tiled at all,
+/// as seen live, needs an AX create event mid-frame, which the mock can't do.)
+fn run_window_launched_with_display_change(spawn: bool) {
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 }, // 0
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToDisplay(Direction::North)),
+        }, // 1
+        Event::Command {
+            command: Command::Lua(1),
+        }, // 2
+        Event::Command {
+            command: Command::PrintState,
+        }, // 3
+        Event::Command {
+            command: Command::PrintState,
+        }, // 4
+    ];
+    let ext_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let frame = IRect::from_corners(Origin::new(0, 0), Origin::new(0, 0) + size);
+
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds, vec![EXT_WORKSPACE_ID])
+        .with_window(100, |data| data.pid = TEST_PROCESS_ID)
+        .on_iteration(2, move |world, state| {
+            assert_eq!(state.active_display(), EXT_DISPLAY_ID);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 300, frame);
+            state.set_active_display(TEST_DISPLAY_ID);
+            state.queue_event(Event::DisplayChanged);
+            state.queue_event(Event::SpaceChanged);
+            if spawn {
+                state.front_switch(TEST_PROCESS_ID, 100);
+                world.trigger(SpawnWindowTrigger(vec![window]));
+            } else {
+                state.front_switch(TEST_PROCESS_ID, 300);
+            }
+        })
+        .on_iteration(4, |world, _state| {
+            assert_on_workspace!(world, 300, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 300, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_window_launched_and_tiled_before_the_display_change() {
+    run_window_launched_with_display_change(true);
+}
+
+#[test]
+fn test_window_launched_and_found_during_the_display_change() {
+    run_window_launched_with_display_change(false);
+}
+
 /// Without a binding press this is a Cmd-Tab to the app on the laptop, so a
 /// window it opens belongs on the laptop.
 #[test]

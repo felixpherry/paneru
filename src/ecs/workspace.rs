@@ -11,6 +11,7 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::ecs::world::World;
+use bevy::time::Time;
 use bevy::time::common_conditions::on_timer;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -25,9 +26,10 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
 use crate::ecs::params::{ActiveDisplay, WindowCtx, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, DockPosition, FocusedMarker, Initializing, ManualStripOffset,
-    NativeFullscreenMarker, Position, PreviousManagedStrip, RaiseWindow, RepositionMarker,
-    Scrolling, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
+    ActiveWorkspaceMarker, DockPosition, FocusedMarker, Initializing, LaunchedInto,
+    ManualStripOffset, NativeFullscreenMarker, Position, PreviousManagedStrip, RaiseWindow,
+    RepositionMarker, Scrolling, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt,
+    Timeout, Unmanaged,
 };
 use crate::errors::Result;
 use crate::events::{DestroySource, Event};
@@ -366,6 +368,7 @@ fn workspace_change_handler(
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn detect_moved_windows(
     activated_workspace: Single<Entity, Added<ActiveWorkspaceMarker>>,
@@ -376,6 +379,8 @@ fn detect_moved_windows(
         Option<&ChildOf>,
     )>,
     apps: Query<&mut Application>,
+    launched: Query<&LaunchedInto>,
+    time: Res<Time>,
     window_manager: Res<WindowManager>,
     reconcile_state: Option<Res<crate::ecs::display::DisplayReconcileState>>,
     mut ignored_windows: Local<HashSet<WinID>>,
@@ -447,13 +452,20 @@ fn detect_moved_windows(
         return;
     }
 
+    // Only windows tiled elsewhere moved here. One in no strip is new and
+    // apply_window_positions has yet to tile it, possibly on another display,
+    // and one just tiled there is still listed here until its move lands. A
+    // native fullscreen window has a space of its own.
     let moved_set: bevy::ecs::entity::EntityHashSet = moved_windows
         .iter()
         .copied()
         .filter(|&entity| {
-            !workspaces
+            workspaces
                 .iter()
-                .any(|(strip, _, fullscreen, _)| fullscreen && strip.contains(entity))
+                .any(|(strip, _, fullscreen, _)| !fullscreen && strip.contains(entity))
+                && !launched
+                    .get(entity)
+                    .is_ok_and(|launched| launched.settling(time.elapsed()))
         })
         .collect();
     if moved_set.is_empty() {

@@ -16,7 +16,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, FloatingFrame, FocusedMarker, FreshMarker, LaunchedFrom,
-    MissionControlActive, OpenedFrom, PreviousManagedStrip, RetryFrontSwitch,
+    LaunchedInto, MissionControlActive, OpenedFrom, PreviousManagedStrip, RetryFrontSwitch,
     SelectedVirtualMarker, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
@@ -1361,12 +1361,8 @@ pub(super) fn apply_window_positions(
     mut focus_history: ResMut<FocusHistory>,
     mut ctx: WindowCtx,
 ) {
-    // ponytail: any app's window counts, since a launcher's pid isn't the app's
-    // (firefox --new-window hands off to the running Firefox). Long enough for
-    // a running app to open a window, not for a cold start.
-    const LAUNCH_WINDOW: Duration = Duration::from_secs(3);
     let mut launched = launched
-        .filter(|launched| time.elapsed().saturating_sub(launched.at) < LAUNCH_WINDOW)
+        .filter(|launched| time.elapsed().saturating_sub(launched.at) < LaunchedFrom::WINDOW)
         .map(|launched| launched.strip);
 
     for entity in added {
@@ -1469,10 +1465,13 @@ pub(super) fn apply_window_positions(
             // Opened where the user is, so it should take focus even while the
             // app still reports its old window; see window_focused_trigger.
             // Held until the window takes focus.
-            if !properties.dont_focus()
-                && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
-            {
-                entity_commands.try_insert(FreshMarker);
+            if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
+                if !properties.dont_focus() {
+                    entity_commands.try_insert(FreshMarker);
+                }
+                if target.is_some() {
+                    entity_commands.try_insert(LaunchedInto(time.elapsed()));
+                }
             }
         }
 

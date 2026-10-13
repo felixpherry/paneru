@@ -274,6 +274,26 @@ pub struct LaunchedFrom {
     pub at: Duration,
 }
 
+impl LaunchedFrom {
+    // ponytail: any app's window counts, since a launcher's pid isn't the app's
+    // (firefox --new-window hands off to the running Firefox). Long enough for
+    // a running app to open a window, not for a cold start.
+    pub const WINDOW: Duration = Duration::from_secs(3);
+}
+
+/// On a window tiled into the strip a [`LaunchedFrom`] or [`OpenedFrom`]
+/// pointed at, and when. macOS keeps listing it on the space the app opened
+/// it on until its move lands, so the moved-window check leaves it alone for
+/// [`LaunchedFrom::WINDOW`] instead of pulling it back there.
+#[derive(Component)]
+pub struct LaunchedInto(pub Duration);
+
+impl LaunchedInto {
+    pub fn settling(&self, now: Duration) -> bool {
+        now.saturating_sub(self.0) < LaunchedFrom::WINDOW
+    }
+}
+
 /// Marker component used to gather existing processes and windows during initialization.
 #[derive(Component)]
 pub struct ExistingMarker;
