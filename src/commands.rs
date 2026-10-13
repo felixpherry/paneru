@@ -1292,7 +1292,7 @@ fn distance_toward(from: IRect, to: IRect, direction: &Direction) -> Option<i32>
 fn mouse_to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    layout_strips: Query<(&LayoutStrip, Entity)>,
+    layout_strips: Query<(&LayoutStrip, Has<SelectedVirtualMarker>)>,
     displays: Query<(&Display, Has<ActiveDisplayMarker>)>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
@@ -1346,10 +1346,10 @@ fn mouse_to_next_display(
         debug!("no other display to move mouse to.");
         return;
     };
-    let Some((other_strip, _)) = window_manager
+    let Some(other_strip) = window_manager
         .active_display_space(other.id())
         .ok()
-        .and_then(|id| layout_strips.iter().find(|(strip, _)| strip.id() == id))
+        .and_then(|id| shown_row(layout_strips.iter(), id))
     else {
         return;
     };
@@ -1381,6 +1381,18 @@ fn mouse_to_next_display(
     window_manager.warp_mouse(visible_frame.center());
 
     commands.focus_entity(entity, true);
+}
+
+/// The row of `space` its display shows: the selected one, else the first.
+/// A space has a row per virtual workspace, the dynamic spare included, so
+/// any row with the right id may be an empty one the user isn't looking at.
+fn shown_row<'a>(
+    rows: impl Iterator<Item = (&'a LayoutStrip, bool)>,
+    space: WorkspaceId,
+) -> Option<&'a LayoutStrip> {
+    rows.filter(|(strip, _)| strip.id() == space)
+        .min_by_key(|(strip, selected)| (!*selected, strip.virtual_index))
+        .map(|(strip, _)| strip)
 }
 
 /// Distributes heights equally among all windows in the currently focused stack.
@@ -1734,6 +1746,31 @@ fn print_internal_state_handler(
 mod tests {
     use super::*;
     use bevy::prelude::*;
+
+    #[test]
+    fn shown_row_is_the_selected_row_not_the_spare() {
+        let (row0, row1, spare, other) = (
+            LayoutStrip::new(7, 0),
+            LayoutStrip::new(7, 1),
+            LayoutStrip::new(7, 2),
+            LayoutStrip::new(8, 0),
+        );
+        let index = |rows: Vec<(&LayoutStrip, bool)>| {
+            shown_row(rows.into_iter(), 7).map(|strip| strip.virtual_index)
+        };
+        // The spare comes first, as it did live.
+        assert_eq!(
+            index(vec![
+                (&spare, false),
+                (&other, true),
+                (&row1, true),
+                (&row0, false)
+            ]),
+            Some(1)
+        );
+        assert_eq!(index(vec![(&spare, false), (&row0, false)]), Some(0));
+        assert_eq!(index(vec![(&other, true)]), None);
+    }
 
     fn setup_world_with_layout() -> (World, LayoutStrip, Vec<Entity>) {
         let mut world = World::new();
