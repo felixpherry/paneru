@@ -172,10 +172,7 @@ const BADGE_RADIUS: CGFloat = 5.0;
 /// attributed strings with.
 // ponytail: rebuilt on every redraw of every tile, like the title; cache the
 // last label, typed count and size per tile if the zoom stutters.
-fn badge_text(label: &str, typed: usize) -> Retained<NSMutableAttributedString> {
-    // SAFETY: reads an AppKit constant.
-    let weight = unsafe { NSFontWeightBold };
-    let font = NSFont::monospacedSystemFontOfSize_weight(BADGE_FONT_SIZE, weight);
+fn badge_text(label: &str, typed: usize, font: &NSFont) -> Retained<NSMutableAttributedString> {
     let font_key = NSString::from_str("NSFont");
     let color_key = NSString::from_str("CTForegroundColor");
     let text = NSMutableAttributedString::new();
@@ -185,7 +182,7 @@ fn badge_text(label: &str, typed: usize) -> Retained<NSMutableAttributedString> 
         let cg = srgb(rgb, 1.0);
         let color: &AnyObject = (**cg).as_ref();
         let attributes =
-            NSDictionary::from_slices(&[&*font_key, &*color_key], &[&*font as &AnyObject, color]);
+            NSDictionary::from_slices(&[&*font_key, &*color_key], &[font as &AnyObject, color]);
         // SAFETY: an `NSFont` (bridged to `CTFont`) and a `CGColor`, the types
         // these Core Text keys take.
         let piece = unsafe {
@@ -196,16 +193,27 @@ fn badge_text(label: &str, typed: usize) -> Retained<NSMutableAttributedString> 
     text
 }
 
+/// How far down to move a `height`-tall badge's text so its digits, which run
+/// from the baseline up to the cap height, sit centred. A `CATextLayer` puts
+/// the baseline one ascender below its top. The badge font's ascender (24.5)
+/// leaves more room above its digits (cap height 17.8) than the 29 pt line
+/// box leaves below, so unmoved digits sit about a point low. Whole points
+/// keep the text crisp.
+fn badge_text_offset(height: CGFloat, ascender: CGFloat, cap_height: CGFloat) -> CGFloat {
+    (height / 2.0 - (ascender - cap_height / 2.0)).round()
+}
+
 /// One tile's layers: a rounded card holding the window's live `content` once
 /// a frame has arrived, and until then the app icon with the title beneath it.
-/// A keycap badge sits over all of it.
+/// A keycap badge, its fill holding the label, sits over all of it.
 #[derive(Clone)]
 struct TileLayers {
     card: Retained<CALayer>,
     content: Retained<CALayer>,
     icon: Retained<CALayer>,
     title: Retained<CATextLayer>,
-    badge: Retained<CATextLayer>,
+    badge: Retained<CALayer>,
+    badge_label: Retained<CATextLayer>,
 }
 
 impl TileLayers {
@@ -237,10 +245,12 @@ impl TileLayers {
         title.setAlignmentMode(unsafe { kCAAlignmentCenter });
         title.setTruncationMode(unsafe { kCATruncationEnd });
 
-        let badge = CATextLayer::new();
+        let badge = CALayer::new();
         badge.setBackgroundColor(Some(&srgb(BADGE_FILL, 0.92)));
-        badge.setAlignmentMode(unsafe { kCAAlignmentCenter });
         badge.setHidden(true);
+        let badge_label = CATextLayer::new();
+        badge_label.setAlignmentMode(unsafe { kCAAlignmentCenter });
+        badge.addSublayer(&badge_label);
 
         card.addSublayer(&content);
         card.addSublayer(&icon);
@@ -253,6 +263,7 @@ impl TileLayers {
             icon,
             title,
             badge,
+            badge_label,
         }
     }
 
@@ -262,7 +273,7 @@ impl TileLayers {
     fn attach(&self, host: &CALayer, scale: CGFloat) {
         self.icon.setContentsScale(scale);
         self.title.setContentsScale(scale);
-        self.badge.setContentsScale(scale);
+        self.badge_label.setContentsScale(scale);
         host.addSublayer(&self.card);
     }
 
@@ -314,21 +325,27 @@ impl TileLayers {
 
         // One line tall, 8 pt of padding a side, never narrower than tall.
         let badge = tile.badge.as_ref().and_then(|(label, typed)| {
-            let text = badge_text(label, *typed);
+            // SAFETY: reads an AppKit constant.
+            let weight = unsafe { NSFontWeightBold };
+            let font = NSFont::monospacedSystemFontOfSize_weight(BADGE_FONT_SIZE, weight);
+            let text = badge_text(label, *typed, &font);
             let text_size = text.size();
             let size = NSSize::new(
                 (text_size.width + 16.0).max(text_size.height),
                 text_size.height,
             );
-            Some((text, NSRect::new(badge_origin(rect, size)?, size)))
+            let shift = badge_text_offset(size.height, font.ascender(), font.capHeight());
+            Some((text, NSRect::new(badge_origin(rect, size)?, size), shift))
         });
         self.badge.setHidden(badge.is_none());
-        if let Some((text, frame)) = badge {
+        if let Some((text, frame, shift)) = badge {
             self.badge.setFrame(frame);
             self.badge
                 .setCornerRadius(BADGE_RADIUS.min(frame.size.height / 2.0));
+            self.badge_label
+                .setFrame(NSRect::new(NSPoint::new(0.0, shift), frame.size));
             // SAFETY: an attributed string is one of the types `string` takes.
-            unsafe { self.badge.setString(Some(&text)) };
+            unsafe { self.badge_label.setString(Some(&text)) };
         }
     }
 
@@ -811,5 +828,15 @@ mod tests {
             badge_origin(card(42.0, 36.0), badge).is_some(),
             "an exact fit shows"
         );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // The offset is rounded to whole points.
+    fn test_badge_text_offset_centres_the_digits() {
+        // The badge font as measured: a 29 pt line box, ascender 24.49, cap
+        // height 17.85. The digits sit about a point low, so they move up.
+        assert_eq!(badge_text_offset(29.0, 24.49, 17.85), -1.0);
+        // Digits already centred stay put.
+        assert_eq!(badge_text_offset(20.0, 15.0, 10.0), 0.0);
     }
 }
