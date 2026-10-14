@@ -1101,19 +1101,16 @@ fn handle_virtual_window_moves(
             (strip.id() == workspace_id && strip.virtual_index == target_idx).then_some(entity)
         });
 
-        // Must be captured before strip.remove below.
-        let source_neighbour =
-            workspaces
-                .get(source_entity)
-                .ok()
-                .and_then(|(_, strip, _, _, _)| {
-                    strip
-                        .left_neighbour(window_entity)
-                        .or_else(|| strip.right_neighbour(window_entity))
-                });
+        // Captured before strip.remove below. niri: next window down its stack,
+        // else up; otherwise the column that slides into its index, else the
+        // left one. No `hand_off`: history is per Space and shared by its rows.
+        let successor = workspaces
+            .get(source_entity)
+            .ok()
+            .and_then(|(_, strip, ..)| strip.successor(window_entity));
         // If source will be empty after the move, Stay becomes Follow
         // since there's nothing left to look at.
-        let stay = !follow && source_neighbour.is_some();
+        let stay = !follow && successor.is_some();
 
         // With `insert_windows_mid_strip`, the window keeps its current on-screen
         // x. For an existing destination, work out the column slot nearest that x
@@ -1161,14 +1158,11 @@ fn handle_virtual_window_moves(
         // Preserve the source strip's scroll position for when the user returns.
         if !stay
             && let Ok(mut entity_commands) = commands.get_entity(source_entity)
-            && let Ok((_, source_strip, position, _, _)) = workspaces.get(source_entity)
+            && let Ok((_, _, position, _, _)) = workspaces.get(source_entity)
         {
-            let focus = source_strip
-                .left_neighbour(window_entity)
-                .or_else(|| source_strip.right_neighbour(window_entity));
             entity_commands.try_insert(PreviousStripPosition {
                 origin: position.0,
-                focus,
+                focus: successor,
             });
         }
 
@@ -1207,9 +1201,9 @@ fn handle_virtual_window_moves(
             entity_commands.try_insert(ActiveWorkspaceMarker);
         }
 
-        if stay && let Some(neighbour) = source_neighbour {
+        if stay && let Some(successor) = successor {
             // Layout chain repositions the window offscreen with its hidden strip.
-            commands.focus_entity(neighbour, false);
+            commands.focus_entity(successor, false);
 
             // Force position change on the hidden strip, so it hides the moved window.
             if let Ok(mut position) = workspaces

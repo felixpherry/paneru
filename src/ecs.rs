@@ -5,7 +5,8 @@ use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
 use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::query::{Added, Changed, With};
+use bevy::ecs::lifecycle::RemovedComponents;
+use bevy::ecs::query::{Added, Changed, Or, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
 use bevy::ecs::schedule::common_conditions::{not, resource_changed, resource_exists};
@@ -115,6 +116,12 @@ pub enum PostUpdateSet {
     Bookkeeping,
 }
 
+/// The focused window moved or resized: its border has to follow.
+type FocusedFrameChanges = (
+    With<FocusedMarker>,
+    Or<(Changed<Position>, Changed<Bounds>)>,
+);
+
 /// Registers the Bevy systems for the `WindowManager`.
 /// This function adds various systems to the `Update` schedule, including event dispatchers,
 /// process/application/window lifecycle management, animation, and periodic watchers.
@@ -134,24 +141,24 @@ pub fn register_systems(app: &mut bevy::app::App) {
             .next()
             .is_none_or(|marker| !marker.is_user_swiping)
     };
-    let dimming_enabled = |config: Option<Res<Config>>| {
-        config
-            .is_some_and(|config| config.has_dim_inactive_color() || config.border_active_window())
-    };
     // The overlay must refresh not just when the active strip's layout changes,
-    // but also whenever focus moves — including focus *loss* (e.g. switching to
-    // an empty virtual workspace), which otherwise leaves a stale outline.
-    // Position changes on the focused window also dirty the overlay so that
-    // dragging a floating window moves the highlight with it.
+    // but also whenever focus moves — including focus *loss* (e.g. closing the
+    // focused floating window on an empty row), which otherwise leaves a stale
+    // outline. Moving or resizing the focused window also dirties it, so the
+    // highlight follows a dragged or resized floating window. Reloads and
+    // Mission Control are added at registration.
     let vw_indicator_dirty =
-        |strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
+        |mut focus_lost: RemovedComponents<FocusedMarker>,
+         strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
          focus_gained: Query<(), Added<FocusedMarker>>,
          workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
-         focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>| {
-            !strip_changed.is_empty()
+         focused_changed: Query<(), FocusedFrameChanges>| {
+            // Read first: `||` would skip it, and an unread removal re-fires next frame.
+            focus_lost.read().count() > 0
+                || !strip_changed.is_empty()
                 || !focus_gained.is_empty()
                 || !workspace_changed.is_empty()
-                || !focused_moved.is_empty()
+                || !focused_changed.is_empty()
         };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
@@ -296,13 +303,18 @@ pub fn register_systems(app: &mut bevy::app::App) {
         )
             .in_set(PostUpdateSet::Animate),
     );
+    app.init_resource::<systems::OverlayShown>();
     app.add_systems(
         PostUpdate,
         (
             (
-                systems::update_overlays
-                    .run_if(dimming_enabled)
-                    .run_if(vw_indicator_dirty),
+                // Not gated on the border or dim being on: a reload that turns
+                // both off must still reach the body, which removes the overlay.
+                systems::update_overlays.run_if(
+                    vw_indicator_dirty
+                        .or_eager(resource_changed::<Config>)
+                        .or_eager(resource_changed::<MissionControlActive>),
+                ),
                 systems::update_flash_messages,
             )
                 .chain(),
@@ -371,6 +383,13 @@ pub struct ActiveDisplayMarker;
 /// Marker component signifying a freshly created process, application, or window.
 #[derive(Component)]
 pub struct FreshMarker;
+
+/// A new window tiled right of this column, the one focused when it opened.
+/// Its first real focus makes it the active column with the way back to that
+/// column (niri's `activate_prev_column_on_removal`); see
+/// `FocusHistory::tiled_beside`.
+#[derive(Component)]
+pub struct OpenedBeside(pub Entity);
 
 /// On an application: it came to the front with `window_id` focused before
 /// paneru knew that window, while the user was on `strip`. The app opened the
@@ -596,11 +615,15 @@ pub struct StrayFocusEvent(pub WinID);
 #[derive(Component)]
 pub struct RetryFrontSwitch(pub Entity);
 
-/// Marker component attached to a window after a keyboard focus request to
-/// verify whether the application accepted or rejected focus once the settle
-/// [`Timeout`] completes.
+/// Attached to a window after a keyboard focus request to verify whether the
+/// application accepted or rejected focus once the settle [`Timeout`]
+/// completes.
 #[derive(Component)]
-pub struct VerifyFocus;
+pub struct VerifyFocus {
+    /// The window the target's app had focused when the request was made. The
+    /// app still reporting it once the check runs is a refusal.
+    pub was: Option<WinID>,
+}
 
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);

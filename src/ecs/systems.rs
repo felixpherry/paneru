@@ -1036,14 +1036,27 @@ pub(super) struct OverlayWindowConfigCache {
     detected_border_radius: Option<f64>,
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What the border and dim overlay shows. `update_overlays` keeps it current
+/// whether or not there is an `OverlayManager` to draw it; tests read it.
+#[derive(bevy::ecs::resource::Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OverlayShown {
+    #[default]
+    Removed,
+    Hidden,
+    /// Drawn around the focused window's frame.
+    Drawn(IRect),
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn update_overlays(
-    // Gating lives in the `overlay_dirty` run condition (strip change *or*
-    // focus change); this query just resolves the current active workspace.
+    // Gating lives in the `vw_indicator_dirty` run condition (strip, focus gain or
+    // loss, focused move or resize, reload, Mission Control); this query just
+    // resolves the current active workspace.
     active_workspace: Populated<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
     windows: Windows,
     applications: Query<&Application>,
-    overlay_mgr: Option<NonSendMut<OverlayManager>>,
+    mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
+    mut shown: ResMut<OverlayShown>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
     mut window_config_cache: Local<OverlayWindowConfigCache>,
@@ -1051,10 +1064,6 @@ pub(super) fn update_overlays(
 ) {
     use crate::overlay::BorderParams;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
-
-    let Some(mut overlay_mgr) = overlay_mgr else {
-        return;
-    };
 
     let dim_opacity = config.dim_inactive_opacity();
     let border_enabled = config.border_active_window();
@@ -1066,18 +1075,27 @@ pub(super) fn update_overlays(
     };
 
     if swiping || mission_control_active.0 || active_strip.is_fullscreen() {
-        overlay_mgr.hide_all();
+        *shown = OverlayShown::Hidden;
+        if let Some(overlay) = overlay_mgr.as_mut() {
+            overlay.hide_all();
+        }
         return;
     }
 
     if dim_opacity == 0.0 && !border_enabled {
-        overlay_mgr.remove_all();
+        *shown = OverlayShown::Removed;
+        if let Some(overlay) = overlay_mgr.as_mut() {
+            overlay.remove_all();
+        }
         return;
     }
 
     // Closing the last window leaves nothing focused; hide the stale outline.
     let Some((window, entity)) = windows.focused() else {
-        overlay_mgr.hide_all();
+        *shown = OverlayShown::Hidden;
+        if let Some(overlay) = overlay_mgr.as_mut() {
+            overlay.hide_all();
+        }
         return;
     };
     let focused_window_id = window.id();
@@ -1097,7 +1115,10 @@ pub(super) fn update_overlays(
     if !show_overlay {
         // No managed window on the active workspace has focus — hide the overlay rather than
         // dimming everything or drawing a ghost border around an off-screen window.
-        overlay_mgr.hide_all();
+        *shown = OverlayShown::Hidden;
+        if let Some(overlay) = overlay_mgr.as_mut() {
+            overlay.hide_all();
+        }
         return;
     }
 
@@ -1151,12 +1172,15 @@ pub(super) fn update_overlays(
     };
 
     let dim_color = config.dim_inactive_color();
-    overlay_mgr.update(
-        dim_opacity,
-        dim_color,
-        focused_abs_cg,
-        border_params.as_ref(),
-    );
+    *shown = OverlayShown::Drawn(window.frame());
+    if let Some(overlay) = overlay_mgr.as_mut() {
+        overlay.update(
+            dim_opacity,
+            dim_color,
+            focused_abs_cg,
+            border_params.as_ref(),
+        );
+    }
 }
 
 #[instrument(level = Level::TRACE, skip_all)]

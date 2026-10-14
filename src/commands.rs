@@ -7,6 +7,7 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_changed};
 use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
 use bevy::math::IRect;
+use bevy::time::Time;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info, warn};
 
@@ -15,7 +16,7 @@ mod query;
 use crate::config::Config;
 use crate::config::snippet::{RuleSubject, SnippetDialect, window_rule_snippet};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::focus::FocusHistory;
+use crate::ecs::focus::{FocusHistory, leave_row};
 use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
 };
@@ -23,7 +24,7 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::workspace::column_closest_to_center;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, FullWidthMarker,
-    ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
+    ManualStripOffset, NativeFullscreenMarker, OpenedBeside, RaiseWindow, SelectedVirtualMarker,
     SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
@@ -290,13 +291,21 @@ fn nearest_float_in_direction(
 fn focus_with_verification(
     entity: Entity,
     focused_entity: Option<Entity>,
+    windows: &Windows,
+    apps: &Query<&Application>,
     commands: &mut Commands,
 ) {
     if focused_entity != Some(entity)
         && let Ok(mut entity_commands) = commands.get_entity(entity)
     {
+        // What the target's app has focused now; see VerifyFocus.
+        let was = windows
+            .get(entity)
+            .and_then(|window| windows.find_parent(window.id()))
+            .and_then(|(_, _, app)| apps.get(app).ok())
+            .and_then(|app| app.focused_window_id().ok());
         entity_commands.try_insert((
-            crate::ecs::VerifyFocus,
+            crate::ecs::VerifyFocus { was },
             Timeout::for_component::<crate::ecs::VerifyFocus>(
                 crate::ecs::focus::VERIFY_FOCUS_TIMEOUT,
             ),
@@ -311,6 +320,7 @@ fn command_move_focus(
     workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
+    apps: Query<&Application>,
     mut commands: Commands,
 ) {
     let Some(Operation::Focus(direction)) =
@@ -340,7 +350,13 @@ fn command_move_focus(
 
         if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
             debug!("fullscreen: swap raising {entity}");
-            focus_with_verification(entity, windows.focused().map(|(_, e)| e), &mut commands);
+            focus_with_verification(
+                entity,
+                windows.focused().map(|(_, e)| e),
+                &windows,
+                &apps,
+                &mut commands,
+            );
         }
         return;
     }
@@ -360,7 +376,7 @@ fn command_move_focus(
             active_strip.id(),
             active_display.bounds(),
         ) {
-            focus_with_verification(entity, Some(focused_entity), &mut commands);
+            focus_with_verification(entity, Some(focused_entity), &windows, &apps, &mut commands);
         }
         return;
     }
@@ -401,7 +417,7 @@ fn command_move_focus(
     };
 
     if let Some(entity) = candidate {
-        focus_with_verification(entity, Some(focused_entity), &mut commands);
+        focus_with_verification(entity, Some(focused_entity), &windows, &apps, &mut commands);
         // Explicitly reshuffle so the target window is brought into view.
         // This avoids a race where focus-follows-mouse leaves skip_reshuffle
         // set, causing the WindowFocused handler to skip the reshuffle.
@@ -1137,7 +1153,7 @@ fn copy_window_rule(
 /// first other display for `ToNextDisplay`, or the nearest one in a direction
 /// for `ToDisplay`. Like a virtual workspace move, it lands as a new column
 /// right of the target row's active column, sized for the target viewport.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn to_next_display(
     mut messages: MessageReader<Event>,
@@ -1145,9 +1161,11 @@ fn to_next_display(
     mut source_strip: Single<&mut LayoutStrip, With<ActiveWorkspaceMarker>>,
     displays: Query<(&Display, Option<&DockPosition>, Has<ActiveDisplayMarker>)>,
     mut other_workspaces: OffscreenStrips,
+    opened_beside: Query<&OpenedBeside>,
     mut focus_history: ResMut<FocusHistory>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
+    time: Res<Time>,
     mut commands: Commands,
 ) {
     let Some((direction, move_focus)) = filter_window_operations(&mut messages, |op| {
@@ -1210,17 +1228,28 @@ fn to_next_display(
     let moving = source_strip
         .tab_group(entity)
         .unwrap_or_else(|| vec![entity]);
-    let source_neighbour = source_strip
-        .left_neighbour(entity)
-        .or_else(|| source_strip.right_neighbour(entity));
-    for moving_entity in &moving {
-        source_strip.remove(*moving_entity);
+    // The rest of its tab group first, so the focused window leaves as a lone
+    // column and hands off by the rule (a native tab never hands off).
+    for member in moving.iter().filter(|&&member| member != entity) {
+        source_strip.remove(*member);
     }
-    if let Some(neighbour) = source_neighbour {
-        commands.reshuffle_around(neighbour);
+    // Follow: the source Space now remembers the successor, too.
+    if let Some(next) = leave_row(
+        &mut source_strip,
+        entity,
+        &mut focus_history,
+        time.elapsed(),
+        Some(entity),
+        opened_beside.get(entity).ok().map(|beside| beside.0),
+    ) {
+        commands.reshuffle_around(next);
         if matches!(move_focus, MoveFocus::Stay) {
-            commands.focus_entity(neighbour, false);
+            commands.focus_entity(next, false);
         }
+    }
+    // Its anchor stays behind on the source row.
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<OpenedBeside>();
     }
 
     // niri: the window becomes a new column right of the target's active one.
@@ -1278,15 +1307,16 @@ fn distance_toward(from: IRect, to: IRect, direction: &Direction) -> Option<i32>
     (distance > 0).then_some(distance)
 }
 
-/// Moves the mouse pointer to another display and focuses its most visible
-/// window: the display the pointer is not on for `ToNextDisplay`, or the
-/// nearest one in a direction for `ToDisplay`.
+/// Moves the mouse pointer to another display and focuses the window last
+/// focused there, else its most visible window: the display the pointer is not
+/// on for `ToNextDisplay`, or the nearest one in a direction for `ToDisplay`.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn mouse_to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
     layout_strips: Query<(&LayoutStrip, Has<SelectedVirtualMarker>)>,
     displays: Query<(&Display, Has<ActiveDisplayMarker>)>,
+    focus_history: Res<FocusHistory>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
@@ -1348,18 +1378,26 @@ fn mouse_to_next_display(
     };
 
     let visible_width = |frame: IRect| other.bounds().intersect(frame).width();
-    let Some((frame, entity)) = other_strip
-        .all_windows()
-        .iter()
-        .filter_map(|entity| windows.frame(*entity).zip(Some(*entity)))
-        .max_by(|left, right| {
-            if visible_width(left.0) < visible_width(right.0) {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            }
-        })
-    else {
+    // The window last focused there while any of it shows, else the widest
+    // visible one.
+    let remembered = focus_history
+        .last_managed(other_strip.id())
+        .filter(|entity| other_strip.contains(*entity))
+        .and_then(|entity| windows.frame(entity).zip(Some(entity)))
+        .filter(|(frame, _)| visible_width(*frame) > 0);
+    let Some((frame, entity)) = remembered.or_else(|| {
+        other_strip
+            .all_windows()
+            .iter()
+            .filter_map(|entity| windows.frame(*entity).zip(Some(*entity)))
+            .max_by(|left, right| {
+                if visible_width(left.0) < visible_width(right.0) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            })
+    }) else {
         debug!("no suitable windows on the other display to move the mouse.");
         let center = other.bounds().center();
         window_manager.warp_mouse(center);

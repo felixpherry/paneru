@@ -16,11 +16,12 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, FloatingFrame, FocusedMarker, FreshMarker, LaunchedFrom,
-    LaunchedInto, MissionControlActive, OpenedFrom, PreviousManagedStrip, RetryFrontSwitch,
-    SelectedVirtualMarker, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    LaunchedInto, MissionControlActive, OpenedBeside, OpenedFrom, PreviousManagedStrip,
+    RetryFrontSwitch, SelectedVirtualMarker, SpawnWindowTrigger, StrayFocusEvent, SystemTheme,
+    Timeout, Unmanaged,
 };
 use crate::config::Config;
-use crate::ecs::focus::FocusHistory;
+use crate::ecs::focus::{FocusHistory, leave_row};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
@@ -282,6 +283,7 @@ pub(super) fn theme_change_trigger(
 /// * `restore_guards` - Guards absorbing the OS acknowledgment of a restored focus.
 /// * `focus_history` - Per-workspace record of what was focused last.
 /// * `fresh` - New windows that have not had focus yet.
+/// * `opened_beside` - New windows tiled beside the column focused when they opened.
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `time` - When the focus moved, for the close hand-off's grace window.
 /// * `ctx` - Window queries, configuration and the command buffer.
@@ -294,6 +296,7 @@ pub(super) fn window_focused_trigger(
     restore_guards: Query<(Entity, &RestoreFocusMarker)>,
     mut focus_history: ResMut<FocusHistory>,
     fresh: Query<(), With<FreshMarker>>,
+    opened_beside: Query<&OpenedBeside>,
     global_state: GlobalState,
     time: Res<Time>,
     mut ctx: WindowCtx,
@@ -452,6 +455,20 @@ pub(super) fn window_focused_trigger(
         if let Some(workspace_id) = owning_workspace_id.or(active_workspace_id) {
             let unmanaged = ctx.windows.get_managed(entity).and_then(|(_, _, u)| u);
             focus_history.record(workspace_id, entity, unmanaged, time.elapsed());
+            // Its first focus: now it is the active column opened beside
+            // `anchor`, while that column is still in its row.
+            if let Ok(&OpenedBeside(anchor)) = opened_beside.get(entity) {
+                if owner.is_some_and(|(row, _)| {
+                    workspaces
+                        .get(row)
+                        .is_ok_and(|(_, strip, _)| strip.contains(anchor))
+                }) {
+                    focus_history.tiled_beside(workspace_id, entity, Some(anchor));
+                }
+                if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
+                    entity_commands.try_remove::<OpenedBeside>();
+                }
+            }
         }
 
         // The restore guard absorbs the OS focus acknowledgment from a restore;
@@ -866,38 +883,45 @@ fn remember_managed_strip(entity: Entity, strip: &LayoutStrip, commands: &mut Co
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_minimized_trigger(
     trigger: On<Add, Unmanaged>,
     windows: Windows,
-    workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    active_display: Single<&Display, With<ActiveDisplayMarker>>,
+    mut workspaces: Query<&mut LayoutStrip>,
+    opened_beside: Query<&OpenedBeside>,
+    mut focus_history: ResMut<FocusHistory>,
+    time: Res<Time>,
     mut config: GlobalState,
     mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
-    if let Some((_, _, Some(Unmanaged::Minimized | Unmanaged::Hidden))) =
-        windows.get_managed(entity)
-    {
-        debug!("Entity {entity} is minimized or hidden.");
-        let display_bounds = active_display.bounds();
-
-        for (mut strip, active) in workspaces {
-            if active {
-                give_away_focus(
-                    entity,
-                    &windows,
-                    &strip,
-                    &display_bounds,
-                    &mut config,
-                    &mut commands,
-                );
-            }
-            if strip.contains(entity) {
-                remember_managed_strip(entity, &strip, &mut commands);
-                strip.remove(entity);
-            }
-        }
+    let Some((_, _, Some(Unmanaged::Minimized | Unmanaged::Hidden))) = windows.get_managed(entity)
+    else {
+        return;
+    };
+    debug!("Entity {entity} is minimized or hidden.");
+    let focused = windows.focused().map(|(_, focused)| focused);
+    // Only the row holding it; a window that wasn't the active column, or
+    // lost focus to another display or a float, leaves focus where it is.
+    let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) else {
+        return;
+    };
+    remember_managed_strip(entity, &strip, &mut commands);
+    if let Some(next) = leave_row(
+        &mut strip,
+        entity,
+        &mut focus_history,
+        time.elapsed(),
+        focused,
+        opened_beside.get(entity).ok().map(|beside| beside.0),
+    ) {
+        config.set_ffm_flag(None);
+        commands.focus_entity(next, true);
+    }
+    // Back in the row later, it is tiled back, not opened beside its anchor.
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<OpenedBeside>();
     }
 }
 
@@ -1127,71 +1151,6 @@ pub(super) fn invalidate_window_title(mut messages: MessageReader<Event>, window
     }
 }
 
-/// Moves the focus away to a neighbour window when one is minimized or hidden.
-/// Closing windows hand focus on in `window_removal_trigger` instead.
-fn give_away_focus(
-    entity: Entity,
-    windows: &Windows,
-    active_strip: &LayoutStrip,
-    viewport: &IRect,
-    config: &mut GlobalState,
-    commands: &mut Commands,
-) {
-    if active_strip.is_tabbed_display(entity)
-        && let Some(sibling) = active_strip.tab_display_sibling(entity)
-    {
-        // Closing/losing focus on the active tab of a paneru-tabbed-display
-        // stack must focus the next tab, not fall through to the
-        // nearest-column search below — that search returns one
-        // representative entity per column, and this column's own entry
-        // was `entity` itself, so it would otherwise jump to an unrelated
-        // neighbouring column.
-        config.set_ffm_flag(None);
-        commands.focus_entity(sibling, true);
-        return;
-    }
-
-    if active_strip.tabbed(entity) {
-        // Do not give away focus for tabbed windows.
-        // Remaining tab gets the focus.
-        return;
-    }
-    let display_center = viewport.center().x;
-    let closest = active_strip
-        .all_columns()
-        .into_iter()
-        .filter(|&candidate| candidate != entity)
-        .filter_map(|candidate| {
-            let center = windows.moving_frame(candidate)?.center().x;
-            let distance = (center - display_center).abs();
-            Some((candidate, distance))
-        })
-        .min_by_key(|(_, dist)| *dist)
-        .map(|(e, _)| e)
-        .or_else(|| {
-            // Fallback when no candidate has a usable frame: pick any other
-            // column in the strip. Without this, losing focus on the only
-            // geometrically-known window would leave FocusedMarker unset and
-            // silently break keybindings.
-            active_strip
-                .all_columns()
-                .into_iter()
-                .find(|&candidate| candidate != entity)
-        });
-
-    if let Some(neighbour) = closest
-        && windows.get(neighbour).is_some()
-    {
-        config.set_ffm_flag(None);
-        // Use focus_entity instead of triggering Event::WindowFocused: the
-        // OS has usually handed focus to a different app after the current
-        // window closed/hid, so window_focused_trigger's frontmost/focused
-        // guards would reject a fabricated event. focus_entity calls the
-        // AX API to raise the neighbour and inserts FocusedMarker directly.
-        commands.focus_entity(neighbour, true);
-    }
-}
-
 /// Handles the event when a new window is created. It adds the window to the manager and sets focus.
 ///
 /// # Arguments
@@ -1373,7 +1332,6 @@ pub(super) fn apply_window_positions(
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
-    mut focus_history: ResMut<FocusHistory>,
     mut ctx: WindowCtx,
 ) {
     let mut launched = launched
@@ -1474,17 +1432,18 @@ pub(super) fn apply_window_positions(
                 }
                 None => strip.append(entity),
             }
-            if let Some((anchor, _)) = anchor
-                && !properties.dont_focus()
-            {
-                focus_history.tiled_beside(strip.id(), entity, Some(anchor));
-            }
             // Opened where the user is, so it should take focus even while the
             // app still reports its old window; see window_focused_trigger.
             // Held until the window takes focus.
             if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
                 if !properties.dont_focus() {
                     entity_commands.try_insert(FreshMarker);
+                    // Becomes the active column beside `anchor` once it takes
+                    // focus (window_focused_trigger), not now: it may open in
+                    // the background.
+                    if let Some((anchor, _)) = anchor {
+                        entity_commands.try_insert(OpenedBeside(anchor));
+                    }
                 }
                 if target.is_some() {
                     entity_commands.try_insert(LaunchedInto(time.elapsed()));
@@ -1631,6 +1590,7 @@ pub(super) fn window_removal_trigger(
         Has<SelectedVirtualMarker>,
     )>,
     windows: Windows,
+    opened_beside: Query<&OpenedBeside>,
     mut focus_history: ResMut<FocusHistory>,
     time: Res<Time>,
     mut global_state: GlobalState,
@@ -1650,29 +1610,14 @@ pub(super) fn window_removal_trigger(
             "Removing despawned entity {entity} from strip {}",
             strip.id()
         );
-        let tabbed = strip.tabbed(entity);
-        let index = strip.index_of(entity).ok();
-        let successor = strip.successor(entity);
-        let same_column = successor.is_some_and(|next| strip.index_of(next).ok() == index);
-        let was_active = focus_history.last_managed(strip.id()) == Some(entity);
-        strip.remove(entity);
-
-        // A native tab leaves picking the next tab to the app.
-        if !tabbed
-            && let Some(active) = focus_history.hand_off(
-                strip.id(),
-                entity,
-                Some(time.elapsed()),
-                |column| !same_column && strip.contains(column),
-                successor,
-            )
-            // Not active yet still handed on: it lost focus within the grace.
-            // Nothing focused: an earlier close this frame queued its focus
-            // hand-off, which hasn't landed yet.
-            && (had_focus || !was_active || focused.is_none())
-        {
-            next = Some(active);
-        }
+        next = leave_row(
+            &mut strip,
+            entity,
+            &mut focus_history,
+            time.elapsed(),
+            focused,
+            opened_beside.get(entity).ok().map(|beside| beside.0),
+        );
         if had_focus && strip.len() == 0 {
             emptied = Some(strip.id());
         }

@@ -10,6 +10,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
+use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Populated, Query, Res, Single};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
@@ -19,6 +20,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Timeout, Unmanaged, VerifyFocus};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::overview::Overview;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::{RestoreFocusMarker, column_closest_to_center};
 use crate::ecs::{
@@ -46,7 +48,7 @@ type MouseFocusStrips<'w, 's> = Query<
     ),
 >;
 
-/// How long after losing focus a closing window still counts as focused.
+/// How long after losing focus a leaving window still counts as focused.
 /// An app that closes one of several windows can focus its own next window
 /// before the close reaches us. // ponytail: fixed heuristic — a window that
 /// closes by itself within this long after the user moved off it still hands
@@ -112,17 +114,19 @@ impl FocusHistory {
         }
     }
 
-    /// `entity` was tiled back as a new column right of `anchor` and has focus:
-    /// it becomes the active column, and floating it again returns to `anchor`.
+    /// `entity` was opened or tiled back as a new column right of `anchor` and
+    /// has focus: it becomes the active column, and floating it again returns
+    /// to `anchor`.
     pub fn tiled_beside(&mut self, workspace: WorkspaceId, entity: Entity, anchor: Option<Entity>) {
         let slot = self.by_workspace.entry(workspace).or_default();
         slot.last_managed = Some(entity);
         slot.return_to = anchor;
     }
 
-    /// `entity` left the strip of `workspace` by closing (`now` is `Some`) or
-    /// floating (`None`). If it was the active column, or is closing and lost
-    /// that role within `CLOSE_FOCUS_GRACE`, the role goes to the column it was
+    /// `entity` left the strip of `workspace` by leaving its row (`now` is
+    /// `Some`: close, hide, minimize, display move) or floating (`None`). If it
+    /// was the active column, or is leaving and lost that role within
+    /// `CLOSE_FOCUS_GRACE`, the role goes to the column it was
     /// opened or tiled back beside (when that is `still_there`), otherwise to
     /// `successor`. Returns the new active column; `None` means `entity` wasn't
     /// the active column and focus must not move.
@@ -193,6 +197,55 @@ impl FocusHistory {
     }
 }
 
+/// `entity` leaves `strip`: it closes, hides, minimizes or moves to another
+/// display. Removes it and hands the active-column role on by the niri rule
+/// (`FocusHistory::hand_off` with the strip's successor). Returns the window
+/// to focus: `None` when `entity` isn't in `strip`, is a native tab (the app
+/// picks the next tab), wasn't the active column, or focus is held elsewhere.
+/// `opened_beside` is its [`super::OpenedBeside`] anchor, still there while
+/// its first focus was never recorded.
+pub fn leave_row(
+    strip: &mut LayoutStrip,
+    entity: Entity,
+    history: &mut FocusHistory,
+    now: Duration,
+    focused: Option<Entity>,
+    opened_beside: Option<Entity>,
+) -> Option<Entity> {
+    let index = strip.index_of(entity).ok()?;
+    let tabbed = strip.tabbed(entity);
+    let successor = strip.successor(entity);
+    let same_column = successor.is_some_and(|next| strip.index_of(next).ok() == Some(index));
+    strip.remove(entity);
+    if tabbed {
+        return None;
+    }
+    // The focused window is the active column even when its focus was never
+    // recorded: right after startup, or focus reached it by a path that
+    // doesn't record. Record it now as its first focus would have
+    // (window_focused_trigger). That drops the stale entry's anchor, which
+    // stops counting once another column has focus.
+    if focused == Some(entity) && history.last_managed(strip.id()) != Some(entity) {
+        history.record(strip.id(), entity, None, now);
+        if let Some(anchor) = opened_beside.filter(|anchor| strip.contains(*anchor)) {
+            history.tiled_beside(strip.id(), entity, Some(anchor));
+        }
+    }
+    let was_active = history.last_managed(strip.id()) == Some(entity);
+    history
+        .hand_off(
+            strip.id(),
+            entity,
+            Some(now),
+            |column| !same_column && strip.contains(column),
+            successor,
+        )
+        // Not active yet still handed on: it lost focus within the grace.
+        // Nothing focused: an earlier leave this frame queued its hand-off,
+        // which hasn't landed yet.
+        .filter(|_| focused == Some(entity) || !was_active || focused.is_none())
+}
+
 pub struct FocusEventsPlugin;
 
 impl Plugin for FocusEventsPlugin {
@@ -213,7 +266,12 @@ impl Plugin for FocusEventsPlugin {
             PostUpdate,
             (
                 clear_pending_focus_layout.in_set(super::PostUpdateSet::Bookkeeping),
-                mouse_follows_focus.in_set(super::PostUpdateSet::Ui),
+                mouse_follows_focus
+                    .in_set(super::PostUpdateSet::Ui)
+                    // Overview arrows move real focus; the pointer stays on the
+                    // overview. Skipped runs keep `Added<FocusedMarker>`, so it
+                    // catches up once after close.
+                    .run_if(not(resource_exists::<Overview>)),
                 recover_lost_focus
                     .in_set(super::PostUpdateSet::Bookkeeping)
                     .run_if(on_timer(Duration::from_millis(
@@ -367,13 +425,13 @@ fn maintain_verify_focus_singleton(
 
 #[instrument(level = Level::DEBUG, skip_all)]
 fn detect_focus_rejection(
-    pending: Populated<(Entity, &Window, &ChildOf, &Timeout), With<VerifyFocus>>,
+    pending: Populated<(Entity, &Window, &ChildOf, &Timeout, &VerifyFocus)>,
     apps: Query<&Application>,
     mut workspaces: Query<(Entity, &mut LayoutStrip)>,
     windows: Windows,
     mut commands: Commands,
 ) {
-    for (target_entity, target_window, child_of, timeout) in &pending {
+    for (target_entity, target_window, child_of, timeout, verify) in &pending {
         if !timeout.timer.is_finished() {
             continue;
         }
@@ -381,8 +439,8 @@ fn detect_focus_rejection(
             continue;
         };
         // Only treat as a rejection if the target window's application is
-        // currently frontmost and reports a different window of the same app
-        // as focused.
+        // currently frontmost and still reports the window of its own it had
+        // focused before the request.
         if !app.is_frontmost() {
             continue;
         }
@@ -390,6 +448,11 @@ fn detect_focus_rejection(
             continue;
         };
         if actual_window_id == target_window.id() {
+            continue;
+        }
+        // The app now reports a window it didn't have before the request (a new
+        // window, a dialog, the user's Cmd-`): it moved on, it didn't refuse.
+        if verify.was != Some(actual_window_id) {
             continue;
         }
         let Some((actual_window, actual_entity, actual_parent)) =
@@ -1005,6 +1068,102 @@ mod tests {
         assert_eq!(history.last_managed(1), Some(active));
     }
 
+    /// Strip `[a, b]`; `a` is the active column when `recorded`.
+    fn two_columns(world: &mut World, recorded: bool) -> (LayoutStrip, FocusHistory, [Entity; 3]) {
+        let [a, b, c] = [(); 3].map(|()| world.spawn(()).id());
+        let mut strip = LayoutStrip::default();
+        strip.append(a);
+        strip.append(b);
+        let mut history = FocusHistory::default();
+        if recorded {
+            history.record(strip.id(), a, None, Duration::ZERO);
+        }
+        (strip, history, [a, b, c])
+    }
+
+    #[test]
+    fn leave_row_moves_the_active_column_but_not_focus_held_elsewhere() {
+        let mut world = World::new();
+        let now = Duration::from_secs(5);
+
+        let (mut strip, mut history, [a, b, c]) = two_columns(&mut world, true);
+        assert_eq!(
+            leave_row(&mut strip, a, &mut history, now, Some(c), None),
+            None
+        );
+        assert_eq!(history.last_managed(strip.id()), Some(b));
+        assert!(!strip.contains(a));
+
+        let (mut strip, mut history, [a, b, _]) = two_columns(&mut world, true);
+        assert_eq!(
+            leave_row(&mut strip, a, &mut history, now, Some(a), None),
+            Some(b)
+        );
+
+        let (mut strip, mut history, [a, _, c]) = two_columns(&mut world, true);
+        assert_eq!(
+            leave_row(&mut strip, c, &mut history, now, Some(a), None),
+            None
+        );
+        assert_eq!(history.last_managed(strip.id()), Some(a));
+        assert_eq!(strip.len(), 2);
+    }
+
+    /// Right after startup no focus has been recorded yet: the focused window
+    /// still hands focus on, while a window without focus still doesn't.
+    #[test]
+    fn leave_row_hands_on_from_the_focused_window_before_any_focus_was_recorded() {
+        let mut world = World::new();
+        let now = Duration::from_secs(5);
+
+        let (mut strip, mut history, [a, b, _]) = two_columns(&mut world, false);
+        assert_eq!(
+            leave_row(&mut strip, a, &mut history, now, Some(a), None),
+            Some(b)
+        );
+        assert_eq!(history.last_managed(strip.id()), Some(b));
+
+        let (mut strip, mut history, [a, _, c]) = two_columns(&mut world, false);
+        assert_eq!(
+            leave_row(&mut strip, a, &mut history, now, Some(c), None),
+            None
+        );
+        assert_eq!(history.last_managed(strip.id()), None);
+    }
+
+    /// Focus reached `a` by a path that didn't record it, so history still
+    /// names `c`: `a` leaving hands on by the rule all the same, and back to
+    /// the column it was opened beside when that first focus is still due.
+    #[test]
+    fn leave_row_hands_on_from_the_focused_window_over_stale_history() {
+        let mut world = World::new();
+        let now = Duration::from_secs(5);
+        let three_columns = |world: &mut World| {
+            let [a, b, c] = [(); 3].map(|()| world.spawn(()).id());
+            let mut strip = LayoutStrip::default();
+            for column in [c, a, b] {
+                strip.append(column);
+            }
+            let mut history = FocusHistory::default();
+            history.tiled_beside(strip.id(), c, Some(b));
+            (strip, history, [a, b, c])
+        };
+
+        let (mut strip, mut history, [a, b, c]) = three_columns(&mut world);
+        assert_eq!(
+            leave_row(&mut strip, a, &mut history, now, Some(a), None),
+            Some(b)
+        );
+        assert_eq!(history.last_managed(strip.id()), Some(b));
+        assert_eq!(return_to(&history, strip.id()), None, "{c}'s anchor goes");
+
+        let (mut strip, mut history, [a, _, c]) = three_columns(&mut world);
+        assert_eq!(
+            leave_row(&mut strip, a, &mut history, now, Some(a), Some(c)),
+            Some(c)
+        );
+    }
+
     #[test]
     fn forget_clears_previous() {
         let mut world = World::new();
@@ -1069,9 +1228,11 @@ mod tests {
             .expect("target is in the strip");
         world.spawn(strip);
 
-        world
-            .entity_mut(target)
-            .insert((FocusedMarker, VerifyFocus, expired_verify_timeout()));
+        world.entity_mut(target).insert((
+            FocusedMarker,
+            VerifyFocus { was: Some(2) },
+            expired_verify_timeout(),
+        ));
 
         let system_id = world.register_system(detect_focus_rejection);
         _ = world.run_system(system_id);
@@ -1103,9 +1264,11 @@ mod tests {
         strip.append(actual);
         world.spawn(strip);
 
-        world
-            .entity_mut(target)
-            .insert((FocusedMarker, VerifyFocus, expired_verify_timeout()));
+        world.entity_mut(target).insert((
+            FocusedMarker,
+            VerifyFocus { was: Some(2) },
+            expired_verify_timeout(),
+        ));
 
         let system_id = world.register_system(detect_focus_rejection);
         _ = world.run_system(system_id);
@@ -1130,10 +1293,10 @@ mod tests {
 
         world
             .entity_mut(first)
-            .insert((VerifyFocus, expired_verify_timeout()));
+            .insert((VerifyFocus { was: None }, expired_verify_timeout()));
         world
             .entity_mut(second)
-            .insert((VerifyFocus, expired_verify_timeout()));
+            .insert((VerifyFocus { was: None }, expired_verify_timeout()));
         world.flush();
 
         assert!(

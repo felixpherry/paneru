@@ -6,6 +6,7 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::display::FloatingLayer;
+use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, NativeFullscreenMarker,
@@ -2677,4 +2678,90 @@ fn active_space(world: &mut World) -> Option<WorkspaceId> {
         .single(world)
         .ok()
         .map(LayoutStrip::id)
+}
+
+/// The laptop's three windows, with the empty Dell above it.
+fn three_windows_below_an_empty_display() -> TestHarness {
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID])
+        .with_windows(3)
+}
+
+fn to_next_display(move_focus: MoveFocus) -> Event {
+    Event::Command {
+        command: Command::Window(Operation::ToNextDisplay(move_focus)),
+    }
+}
+
+/// Sending the focused middle column to the other display focuses the column
+/// that slides into its place, like closing it does.
+#[test]
+fn test_send_middle_window_to_next_display_focuses_its_right_neighbour() {
+    let mut commands = idle(2);
+    commands.push(to_next_display(MoveFocus::Stay));
+
+    three_windows_below_an_empty_display()
+        .on_iteration(0, |_world, state| state.focus_window(1))
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 1);
+            assert_eq!(strip_columns(world, TEST_WORKSPACE_ID), vec![0, 1, 2]);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_eq!(strip_columns(world, EXT_WORKSPACE_ID), vec![1]);
+            assert_eq!(strip_columns(world, TEST_WORKSPACE_ID), vec![0, 2]);
+            assert_focused!(world, 2);
+        })
+        .run(commands);
+}
+
+/// Following the middle column to the other display: the display it left
+/// remembers the column that slid into its place, for when focus comes back.
+#[test]
+fn test_follow_middle_window_to_next_display_leaves_its_successor_remembered() {
+    let mut commands = idle(2);
+    commands.push(to_next_display(MoveFocus::Follow));
+
+    three_windows_below_an_empty_display()
+        .on_iteration(0, |_world, state| state.focus_window(1))
+        .on_iteration(1, |world, _state| assert_focused!(world, 1))
+        .on_iteration(2, |world, _state| {
+            assert_eq!(strip_columns(world, EXT_WORKSPACE_ID), vec![1]);
+            assert_focused!(world, 1);
+            let right = find_window_entity(2, world);
+            assert_eq!(
+                world
+                    .resource::<FocusHistory>()
+                    .last_managed(TEST_WORKSPACE_ID),
+                Some(right)
+            );
+        })
+        .run(commands);
+}
+
+/// Focusing another display goes back to the window last used there, not to
+/// the widest one, while any of it shows.
+#[test]
+fn test_mouse_to_display_lands_on_the_window_last_used_there() {
+    let mut commands = idle(3);
+    commands.push(Event::Command {
+        command: Command::Mouse(MouseMove::ToDisplay(Direction::North)),
+    });
+
+    harness_with_display_above(&[200, 201])
+        .on_iteration(0, |_world, state| state.focus_window(201))
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 201);
+            state.focus_window(100);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 100);
+            assert_eq!(strip_columns(world, EXT_WORKSPACE_ID), vec![200, 201]);
+            for id in [200, 201] {
+                let entity = find_window_entity(id, world);
+                let frame = world.get::<Window>(entity).expect("window").frame();
+                assert_eq!(ext_bounds().intersect(frame), frame, "{id} fully shown");
+            }
+        })
+        .on_iteration(3, |world, _state| assert_focused!(world, 201))
+        .run(commands);
 }

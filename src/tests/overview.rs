@@ -21,7 +21,7 @@ use crate::ecs::params::{ActiveDisplay, FrameActivity};
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SpawnWindowTrigger};
 use crate::events::Event;
-use crate::manager::Display;
+use crate::manager::{Display, Window};
 use crate::platform::Modifiers;
 
 use super::*;
@@ -811,6 +811,50 @@ fn test_overview_arrow_moves_real_focus_while_open() {
             toggle(),
             key(KEY_RIGHT),
         ]);
+}
+
+/// Overview arrows move real focus, but mouse-follows-focus (on by default)
+/// must not warp the pointer behind the open overview. The pointer is checked
+/// to follow focus before the overview opens and after it closes, so the test
+/// can't pass with mouse-follows-focus simply off.
+#[test]
+fn test_overview_arrow_does_not_warp_the_mouse() {
+    let centre = |world: &mut World, id| {
+        let entity = find_window_entity(id, world);
+        world
+            .get::<Window>(entity)
+            .expect("window")
+            .frame()
+            .center()
+    };
+    let mut commands = idle(2);
+    commands.extend([toggle(), key(KEY_RIGHT), toggle()]);
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(1, move |world, state| {
+            assert_focused!(world, 0);
+            assert_eq!(state.cursor_position(), centre(world, 0), "pointer follows");
+        })
+        .on_iteration(2, |world, _state| {
+            assert!(world.get_resource::<Overview>().is_some(), "open");
+        })
+        .on_iteration(3, move |world, state| {
+            assert_focused!(world, 1);
+            assert_eq!(state.cursor_position(), centre(world, 0), "pointer unmoved");
+        })
+        .on_iteration(4, move |world, state| {
+            assert!(world.get_resource::<Overview>().is_none(), "closed");
+            assert_focused!(world, 1);
+            // Skipped runs keep the focus change, so the pointer moves once.
+            assert_eq!(
+                state.cursor_position(),
+                centre(world, 1),
+                "caught up on close"
+            );
+        })
+        .run(commands);
 }
 
 /// Windows 0 and 1 go to VW1, leaving window 2 alone and focused on VW0. Down

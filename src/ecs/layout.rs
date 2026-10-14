@@ -385,7 +385,7 @@ pub struct LayoutStrip {
     /// cleanup in `remove_column`/ `unstack`/`stack`. This is deliberately independent of
     /// `Column::Tabs`/`StackItem::Tabs` (native-OS-tab detection, see `tabbed`/`tab_group` below)
     /// and of `LayoutStrip::tabbed()`, which callers like
-    /// `apply_window_positions`/`give_away_focus` already key off for that unrelated feature.
+    /// `apply_window_positions` already keys off for that unrelated feature.
     tabbed_stacks: EntityHashSet,
 }
 
@@ -1095,24 +1095,9 @@ impl LayoutStrip {
 
     /// Whether `entity` belongs to a `Column::Stack` currently displayed as
     /// tabs. Independent of `tabbed()` (native-OS-tab detection).
+    #[cfg(test)]
     pub fn is_tabbed_display(&self, entity: Entity) -> bool {
         self.tabbed_stacks.contains(&entity)
-    }
-
-    /// Given `entity` in a tabbed `Column::Stack`, returns the next tab,
-    /// falling back to the previous one when `entity` is last. Used only by
-    /// the close-active-tab focus fallback — normal cycling reuses
-    /// `Operation::Focus` North/South directly.
-    pub fn tab_display_sibling(&self, entity: Entity) -> Option<Entity> {
-        let index = self.index_of(entity).ok()?;
-        let Column::Stack(items) = self.get(index).ok()? else {
-            return None;
-        };
-        let pos = items.iter().position(|item| item.contains(entity))?;
-        items
-            .get(pos + 1)
-            .or_else(|| pos.checked_sub(1).and_then(|p| items.get(p)))
-            .and_then(StackItem::top)
     }
 }
 
@@ -2459,7 +2444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tab_display_sibling_falls_back_at_ends() {
+    fn test_successor_in_a_tabbed_stack_falls_back_at_ends() {
         let mut world = World::new();
         let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
 
@@ -2471,10 +2456,10 @@ mod tests {
         strip.stack(entities[2]).unwrap();
         strip.toggle_tabbed_display(entities[1]);
 
-        assert_eq!(strip.tab_display_sibling(entities[0]), Some(entities[1]));
-        assert_eq!(strip.tab_display_sibling(entities[1]), Some(entities[2]));
+        assert_eq!(strip.successor(entities[0]), Some(entities[1]));
+        assert_eq!(strip.successor(entities[1]), Some(entities[2]));
         // Last item falls back to the previous one instead of wrapping.
-        assert_eq!(strip.tab_display_sibling(entities[2]), Some(entities[1]));
+        assert_eq!(strip.successor(entities[2]), Some(entities[1]));
     }
 
     #[test]

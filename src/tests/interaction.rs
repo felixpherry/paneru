@@ -7,6 +7,7 @@ use objc2_core_foundation::CGPoint;
 use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
+use crate::ecs::systems::OverlayShown;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, BProcess, FocusedMarker, FreshMarker,
     ManualStripOffset, NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
@@ -4014,4 +4015,142 @@ fn test_focus_command_starts_animation_on_first_frame() {
         win0_pos.x, initial_win0_x,
         "window 0 should already have advanced on Frame 0"
     );
+}
+
+/// A keyboard focus request the app answers, followed by a window of the same
+/// app it didn't have focused before taking focus (a new window, Cmd-backtick): the
+/// app moved on, it didn't refuse, so the requested window stays tiled.
+#[test]
+fn focus_moving_to_a_sibling_after_a_keyboard_focus_is_not_a_rejection() {
+    let mut harness = TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(1, |world, _state| assert_focused!(world, 0));
+    harness.run(vec![settle(), settle()]);
+
+    harness.world().write_message(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::East)),
+    });
+    harness.advance(Duration::from_millis(100));
+    assert_focused!(harness.world(), 1);
+    harness.mock_state.focus_window(2);
+    // Past the 300 ms verification.
+    harness.advance(Duration::from_millis(600));
+
+    let world = harness.world();
+    let window = find_window_entity(1, world);
+    assert!(
+        world.get::<Unmanaged>(window).is_none(),
+        "window 1 must not be floated"
+    );
+    assert_eq!(active_columns(world), vec![0, 1, 2]);
+}
+
+/// The focus border on, through the config.
+fn bordered() -> Config {
+    (
+        MainOptions {
+            border_active_window: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+fn overlay(world: &World) -> OverlayShown {
+    *world.resource::<OverlayShown>()
+}
+
+fn assert_drawn(world: &World) {
+    assert!(
+        matches!(overlay(world), OverlayShown::Drawn(_)),
+        "overlay drawn, got {:?}",
+        overlay(world)
+    );
+}
+
+/// Turning the border off by a reload takes it down without a focus change.
+#[test]
+fn overlay_is_removed_when_a_reload_turns_the_border_off() {
+    TestHarness::new()
+        .with_config(bordered())
+        .with_windows(2)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 0);
+            assert_drawn(world);
+            world.insert_resource(Config::default());
+        })
+        .on_iteration(2, |world, _state| {
+            assert_eq!(overlay(world), OverlayShown::Removed);
+        })
+        .run(vec![settle(), settle(), settle()]);
+}
+
+/// Mission Control hides the border while it's open and brings it back after.
+#[test]
+fn overlay_hides_while_mission_control_is_open() {
+    TestHarness::new()
+        .with_config(bordered())
+        .with_windows(2)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 0);
+            assert_drawn(world);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_eq!(overlay(world), OverlayShown::Hidden);
+        })
+        .on_iteration(3, |world, _state| assert_drawn(world))
+        .run(vec![
+            settle(),
+            settle(),
+            Event::MissionControlShowAllWindows,
+            Event::MissionControlExit,
+        ]);
+}
+
+/// The focused floating window closing on an empty row leaves nothing focused
+/// and no row change: the border still has to go.
+#[test]
+fn overlay_hides_when_the_focused_floating_window_closes_on_an_empty_row() {
+    TestHarness::new()
+        .with_config(bordered())
+        .with_windows(1)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(1, |world, _state| assert_focused!(world, 0))
+        .on_iteration(2, |world, state| {
+            assert!(active_columns(world).is_empty(), "0 floats");
+            assert_focused!(world, 0);
+            assert_drawn(world);
+            state.os_close_window(0);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_eq!(overlay(world), OverlayShown::Hidden);
+        })
+        .run(vec![settle(), settle(), manage(), settle()]);
+}
+
+/// Resizing the focused floating window redraws the border at its new size.
+#[test]
+fn overlay_follows_a_resize_of_the_focused_floating_window() {
+    TestHarness::new()
+        .with_config(bordered())
+        .with_windows(2)
+        .on_iteration(0, |_world, state| state.focus_window(1))
+        .on_iteration(1, |world, _state| assert_focused!(world, 1))
+        .on_iteration(2, |world, state| {
+            assert_eq!(active_columns(world), vec![0], "1 floats");
+            assert_focused!(world, 1);
+            assert_drawn(world);
+            state.os_resize_window(1, Size::new(300, 300));
+        })
+        .on_iteration(3, |world, _state| {
+            let OverlayShown::Drawn(frame) = overlay(world) else {
+                panic!("overlay drawn, got {:?}", overlay(world));
+            };
+            assert_eq!(frame.size(), Size::new(300, 300));
+        })
+        .run(vec![settle(), settle(), manage(), settle()]);
 }
