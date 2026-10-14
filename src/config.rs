@@ -2824,15 +2824,22 @@ missing_windows = "reserve"
 
 #[test]
 fn test_static_virtual_key_names_can_be_bound() {
-    let config = Config::try_from(
-        r#"
+    // No layout keymap: static names must bind on their own, and building one
+    // goes through Carbon/TIS, which aborts off the main thread on CI.
+    let config = Config {
+        inner: Arc::new(ArcSwap::from_pointee(
+            InnerConfig::parse_config_with_virtual_keys(
+                r#"
 [options]
 
 [bindings]
 window_grow = "alt - minus"
 "#,
-    )
-    .unwrap();
+                &[],
+            )
+            .unwrap(),
+        )),
+    };
     let minus_keycode = virtual_keycode()
         .find_map(|(key, code)| (*key == "minus").then_some(*code))
         .unwrap();
@@ -2851,6 +2858,9 @@ mod lua_setup_tests {
     /// Runs a `paneru.setup`-style table (as a Lua chunk that returns it) through
     /// the same `config_from_lua` path `paneru.setup` uses.
     fn config_from_source(source: &str) -> Config {
+        // Stand in for `prime_virtual_keymap`, so passthrough chords never
+        // reach Carbon/TIS, which aborts off the main thread on CI.
+        let _ = VIRTUAL_KEYMAP.set(test_virtual_keymap());
         let lua = Lua::new();
         let value: mlua::Value = lua.load(source).eval().expect("lua chunk should evaluate");
         config_from_lua(&lua, value).expect("config_from_lua should succeed")
