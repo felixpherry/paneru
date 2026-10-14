@@ -13,12 +13,14 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSFont, NSImage, NSRunningApplication, NSScreen, NSScreenSaverWindowLevel, NSView, NSWindow,
-    NSWorkspace,
+    NSAttributedStringNSStringDrawing, NSFont, NSFontWeightBold, NSImage, NSRunningApplication,
+    NSScreen, NSScreenSaverWindowLevel, NSView, NSWindow, NSWorkspace,
 };
 use objc2_core_foundation::{CFRetained, CFType, CGFloat};
 use objc2_core_graphics::{CGBitmapContextCreateImage, CGColor, CGDirectDisplayID};
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSAttributedString, NSDictionary, NSMutableAttributedString, NSPoint, NSRect, NSSize, NSString,
+};
 #[cfg(feature = "thumbnails")]
 use objc2_io_surface::IOSurfaceRef;
 use objc2_quartz_core::{
@@ -64,6 +66,9 @@ pub struct SceneTile {
     pub title: String,
     pub tab_count: usize,
     pub hovered: bool,
+    /// The badge's label and how many of its leading keys are typed; `None`
+    /// hides it.
+    pub badge: Option<(String, usize)>,
 }
 
 fn ns_rect(rect: IRect) -> NSRect {
@@ -76,6 +81,25 @@ fn ns_rect(rect: IRect) -> NSRect {
 /// `rect` in the view's flipped local coordinates, given the display origin.
 fn local_rect(rect: IRect, origin: IVec2) -> NSRect {
     ns_rect(IRect::from_corners(rect.min - origin, rect.max - origin))
+}
+
+/// Where a `badge`-sized badge sits in `card`, relative to the card:
+/// `BADGE_MARGIN` in from the top-left corner, slid right or down to stay on
+/// screen while the card hangs off the left or top edge. `card` is in the
+/// overlay's flipped local space, where the screen edge is 0. `None` when the
+/// card is too small to hold it. Umbriel's badge inset.
+fn badge_origin(card: NSRect, badge: NSSize) -> Option<NSPoint> {
+    // The size guard keeps `clamp`'s minimum at or below its maximum.
+    let inset = |origin: CGFloat, extent: CGFloat, size: CGFloat| {
+        (extent >= size + 2.0 * BADGE_MARGIN).then(|| {
+            (origin.max(0.0) + BADGE_MARGIN - origin)
+                .clamp(BADGE_MARGIN, extent - size - BADGE_MARGIN)
+        })
+    };
+    Some(NSPoint::new(
+        inset(card.origin.x, card.size.width, badge.width)?,
+        inset(card.origin.y, card.size.height, badge.height)?,
+    ))
 }
 
 fn srgb(rgb: [f64; 3], alpha: f64) -> CFRetained<CGColor> {
@@ -132,15 +156,53 @@ const WHITE: [f64; 3] = [1.0, 1.0, 1.0];
 const TILE_FILL: [f64; 3] = [0.16, 0.16, 0.18];
 const TILE_RADIUS: CGFloat = 10.0;
 const TITLE_FONT_SIZE: CGFloat = 12.0;
+const BADGE_FILL: [f64; 3] = [0.10, 0.10, 0.12];
+/// The untyped part of a badge's label; the typed part is white.
+const BADGE_ACCENT: [f64; 3] = [0.55, 0.85, 1.0];
+const BADGE_FONT_SIZE: CGFloat = 19.0;
+/// A badge's inset from its card's edges.
+const BADGE_MARGIN: CGFloat = 6.0;
+const BADGE_RADIUS: CGFloat = 6.0;
+
+/// `label` as its badge draws it: the first `typed` bytes white, the rest in
+/// the accent colour. Keyed for Core Text, which is what a `CATextLayer` draws
+/// attributed strings with.
+// ponytail: rebuilt on every redraw of every tile, like the title; cache the
+// last label, typed count and size per tile if the zoom stutters.
+fn badge_text(label: &str, typed: usize) -> Retained<NSMutableAttributedString> {
+    // SAFETY: reads an AppKit constant.
+    let weight = unsafe { NSFontWeightBold };
+    let font = NSFont::monospacedSystemFontOfSize_weight(BADGE_FONT_SIZE, weight);
+    let font_key = NSString::from_str("NSFont");
+    let color_key = NSString::from_str("CTForegroundColor");
+    let text = NSMutableAttributedString::new();
+    // On a character boundary: the label starts with the typed keys.
+    let (head, tail) = label.split_at(typed);
+    for (piece, rgb) in [(head, WHITE), (tail, BADGE_ACCENT)] {
+        let cg = srgb(rgb, 1.0);
+        let color: &AnyObject = (**cg).as_ref();
+        let attributes =
+            NSDictionary::from_slices(&[&*font_key, &*color_key], &[&*font as &AnyObject, color]);
+        // SAFETY: an `NSFont` (bridged to `CTFont`) and a `CGColor`, the types
+        // these Core Text keys take.
+        let piece = unsafe {
+            NSAttributedString::new_with_attributes(&NSString::from_str(piece), &attributes)
+        };
+        text.appendAttributedString(&piece);
+    }
+    text
+}
 
 /// One tile's layers: a rounded card holding the window's live `content` once
 /// a frame has arrived, and until then the app icon with the title beneath it.
+/// A keycap badge sits over all of it.
 #[derive(Clone)]
 struct TileLayers {
     card: Retained<CALayer>,
     content: Retained<CALayer>,
     icon: Retained<CALayer>,
     title: Retained<CATextLayer>,
+    badge: Retained<CATextLayer>,
 }
 
 impl TileLayers {
@@ -172,22 +234,32 @@ impl TileLayers {
         title.setAlignmentMode(unsafe { kCAAlignmentCenter });
         title.setTruncationMode(unsafe { kCATruncationEnd });
 
+        let badge = CATextLayer::new();
+        badge.setBackgroundColor(Some(&srgb(BADGE_FILL, 0.92)));
+        badge.setAlignmentMode(unsafe { kCAAlignmentCenter });
+        badge.setHidden(true);
+
         card.addSublayer(&content);
         card.addSublayer(&icon);
         card.addSublayer(&title);
+        // Last, so it draws above the content, icon and title.
+        card.addSublayer(&badge);
         Self {
             card,
             content,
             icon,
             title,
+            badge,
         }
     }
 
     /// Adds the card to `host`. `scale` is the display's backing scale, for
-    /// crisp icon and text: a cached tile may come back on another display.
+    /// crisp icon, title and badge: a cached tile may come back on another
+    /// display.
     fn attach(&self, host: &CALayer, scale: CGFloat) {
         self.icon.setContentsScale(scale);
         self.title.setContentsScale(scale);
+        self.badge.setContentsScale(scale);
         host.addSublayer(&self.card);
     }
 
@@ -236,6 +308,25 @@ impl TileLayers {
         ));
         // SAFETY: an `NSString` is one of the types `string` takes.
         unsafe { self.title.setString(Some(&NSString::from_str(&caption))) };
+
+        // One line tall, 8 pt of padding a side, never narrower than tall.
+        let badge = tile.badge.as_ref().and_then(|(label, typed)| {
+            let text = badge_text(label, *typed);
+            let text_size = text.size();
+            let size = NSSize::new(
+                (text_size.width + 16.0).max(text_size.height),
+                text_size.height,
+            );
+            Some((text, NSRect::new(badge_origin(rect, size)?, size)))
+        });
+        self.badge.setHidden(badge.is_none());
+        if let Some((text, frame)) = badge {
+            self.badge.setFrame(frame);
+            self.badge
+                .setCornerRadius(BADGE_RADIUS.min(frame.size.height / 2.0));
+            // SAFETY: an attributed string is one of the types `string` takes.
+            unsafe { self.badge.setString(Some(&text)) };
+        }
     }
 
     /// Shows each frame of this tile's stream in `content`, in place of the
@@ -606,6 +697,7 @@ mod tests {
             title: String::new(),
             tab_count: 1,
             hovered: false,
+            badge: None,
         }
     }
 
@@ -669,5 +761,52 @@ mod tests {
         let tiles = [tile(2, DISPLAY), tile(4, DISPLAY)];
         prune(&mut cache, &tiles);
         assert_eq!(cache.into_keys().collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn test_badge_origin_hugs_the_corner_and_stays_on_screen() {
+        let badge = NSSize::new(30.0, 24.0);
+        let card = |x, y| NSRect::new(NSPoint::new(x, y), NSSize::new(300.0, 200.0));
+        let at = |x, y| Some(NSPoint::new(x, y));
+        assert_eq!(
+            badge_origin(card(100.0, 100.0), badge),
+            at(6.0, 6.0),
+            "on screen: the corner"
+        );
+        assert_eq!(
+            badge_origin(card(-40.0, 100.0), badge),
+            at(46.0, 6.0),
+            "40 off the left: 40 + M"
+        );
+        assert_eq!(
+            badge_origin(card(100.0, -40.0), badge),
+            at(6.0, 46.0),
+            "40 off the top: 40 + M"
+        );
+        assert_eq!(
+            badge_origin(card(-280.0, 100.0), badge),
+            at(264.0, 6.0),
+            "mostly off the left: stops at the far margin, 300 - 30 - M"
+        );
+    }
+
+    #[test]
+    fn test_badge_origin_hides_on_a_card_too_small() {
+        let badge = NSSize::new(30.0, 24.0);
+        let card = |w, h| NSRect::new(NSPoint::ZERO, NSSize::new(w, h));
+        assert_eq!(
+            badge_origin(card(41.0, 200.0), badge),
+            None,
+            "30 + 2M needs 42 wide"
+        );
+        assert_eq!(
+            badge_origin(card(300.0, 35.0), badge),
+            None,
+            "24 + 2M needs 36 tall"
+        );
+        assert!(
+            badge_origin(card(42.0, 36.0), badge).is_some(),
+            "an exact fit shows"
+        );
     }
 }

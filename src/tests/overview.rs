@@ -838,6 +838,25 @@ fn test_overview_shortcuts_backspace_and_clear() {
 }
 
 #[test]
+fn test_overview_shortcuts_badge_hides_labels_that_dont_match() {
+    let (mut shortcuts, wins) = eleven_labelled();
+    assert_eq!(
+        shortcuts.badge(wins[0]),
+        Some(("1".to_string(), 0)),
+        "nothing typed: every badge shows in full"
+    );
+
+    shortcuts.press(b'0');
+    assert_eq!(shortcuts.badge(wins[0]), None, "`1` doesn't start with `0`");
+    assert_eq!(
+        shortcuts.badge(wins[9]),
+        Some(("01".to_string(), 1)),
+        "the `0` of `01` is typed"
+    );
+    assert_eq!(shortcuts.badge(wins[10]), Some(("02".to_string(), 1)));
+}
+
+#[test]
 fn test_overview_open_labels_on_screen_tiles() {
     TestHarness::new()
         .with_windows(3)

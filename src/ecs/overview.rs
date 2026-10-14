@@ -516,6 +516,16 @@ impl Shortcuts {
         self.typed.clear();
         typed
     }
+
+    /// `entity`'s badge as drawn: its label and how many of its leading keys
+    /// are typed. `None` without a label, or when the label doesn't start with
+    /// the typed keys, which Umbriel hides.
+    pub fn badge(&self, entity: Entity) -> Option<(String, usize)> {
+        let label = self.badges.get(&entity)?;
+        label
+            .starts_with(&self.typed)
+            .then(|| (label.clone(), self.typed.len()))
+    }
 }
 
 pub struct OverviewPlugin;
@@ -817,6 +827,7 @@ fn overview_render(
     let mut bounds = display.bounds();
     bounds.min.y -= display.menubar_height();
 
+    let closing = overview.phase == OverviewPhase::Closing;
     let tiles = overview
         .layout
         .rows
@@ -836,6 +847,12 @@ fn overview_render(
                     .unwrap_or_default(),
                 tab_count: tile.tab_count,
                 hovered: overview.hovered == Some(tile.entity),
+                // Gone for the zoom back in.
+                badge: if closing {
+                    None
+                } else {
+                    overview.shortcuts.badge(tile.entity)
+                },
             }
         })
         .collect();
