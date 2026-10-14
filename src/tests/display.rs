@@ -10,7 +10,7 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, NativeFullscreenMarker,
-    SpawnWindowTrigger, Timeout,
+    SelectedVirtualMarker, SpawnWindowTrigger, Timeout,
 };
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
@@ -1812,16 +1812,10 @@ fn test_attach_display_moves_virtual_workspace_together() {
             let win2 = find_window_entity(2, world);
             let win3 = find_window_entity(3, world);
 
-            let main_strips: Vec<(u32, Vec<Entity>)> = world
-                .query::<&LayoutStrip>()
-                .iter(world)
-                .filter(|s| s.id() == TEST_WORKSPACE_ID)
-                .map(|s| (s.virtual_index, s.all_windows()))
-                .collect();
             assert_eq!(
-                main_strips,
-                vec![(0, vec![win0, win1])],
-                "source display should only have v0 with [0, 1] after v1 moved away"
+                rows_of(world, TEST_WORKSPACE_ID),
+                [(0, vec![win0, win1], true), (1, vec![], false)],
+                "the emptied v1 is kept after v0: no reaping by default"
             );
 
             let ext_strips: Vec<(u32, Vec<Entity>)> = world
@@ -1962,16 +1956,10 @@ fn test_attach_display_compacts_emptied_first_virtual_workspace() {
             let win2 = find_window_entity(2, world);
             let win3 = find_window_entity(3, world);
 
-            let main_strips: Vec<(u32, Vec<Entity>)> = world
-                .query::<&LayoutStrip>()
-                .iter(world)
-                .filter(|s| s.id() == TEST_WORKSPACE_ID)
-                .map(|s| (s.virtual_index, s.all_windows()))
-                .collect();
             assert_eq!(
-                main_strips,
-                vec![(0, vec![win2, win3])],
-                "emptied v0 on source display must be removed and v1 compacted to v0"
+                rows_of(world, TEST_WORKSPACE_ID),
+                [(0, vec![win2, win3], true), (1, vec![], false)],
+                "v1 takes row 0 and is shown; the emptied v0 is kept after it"
             );
 
             let ext_strips: Vec<(u32, Vec<Entity>)> = world
@@ -2603,6 +2591,25 @@ fn row_entity(world: &mut World, space: WorkspaceId, virtual_index: u32) -> Enti
         )
 }
 
+/// `(virtual_index, windows, shown)` for every row of `space`, by index;
+/// shown = selected or on screen.
+fn rows_of(world: &mut World, space: WorkspaceId) -> Vec<(u32, Vec<Entity>, bool)> {
+    let mut rows = world
+        .query::<(
+            &LayoutStrip,
+            Has<SelectedVirtualMarker>,
+            Has<ActiveWorkspaceMarker>,
+        )>()
+        .iter(world)
+        .filter(|(strip, ..)| strip.id() == space)
+        .map(|(strip, selected, active)| {
+            (strip.virtual_index, strip.all_windows(), selected || active)
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.0);
+    rows
+}
+
 fn row_windows(world: &World, row: Entity) -> Vec<Entity> {
     world
         .get::<LayoutStrip>(row)
@@ -2764,4 +2771,258 @@ fn test_mouse_to_display_lands_on_the_window_last_used_there() {
         })
         .on_iteration(3, |world, _state| assert_focused!(world, 201))
         .run(commands);
+}
+
+fn virtual_number(index: u32) -> Event {
+    Event::Command {
+        command: Command::Window(Operation::VirtualNumber(index)),
+    }
+}
+
+/// Focus the laptop's middle window, switch to an empty row 1 (focus stays on
+/// the window in the parked row 0), then move that window to the Dell (event 3).
+fn display_move_from_an_empty_row(move_focus: MoveFocus) -> (TestHarness, Vec<Event>) {
+    let mut commands = idle(2);
+    commands.push(virtual_number(1));
+    commands.push(to_next_display(move_focus));
+
+    let harness = three_windows_below_an_empty_display()
+        .on_iteration(0, |_world, state| state.focus_window(1))
+        .on_iteration(1, |world, _state| assert_focused!(world, 1))
+        .on_iteration(2, |world, _state| {
+            let row = row_entity(world, TEST_WORKSPACE_ID, 1);
+            assert!(
+                world.get::<ActiveWorkspaceMarker>(row).is_some(),
+                "the empty row 1 is on screen"
+            );
+            assert_focused!(world, 1);
+        });
+    (harness, commands)
+}
+
+/// Going back to the laptop's row 0 after the move landed focuses the
+/// successor that row saved, not the window that left it.
+fn assert_back_on_row_0_focuses_the_successor(world: &mut World) {
+    let row = row_entity(world, TEST_WORKSPACE_ID, 0);
+    assert!(
+        world.get::<ActiveWorkspaceMarker>(row).is_some(),
+        "row 0 is on screen again"
+    );
+    assert_focused!(world, 2);
+}
+
+/// WSD-6: the window leaves the parked row it was in, not just the empty row
+/// on screen, so it never sits on both displays.
+#[test]
+fn test_next_display_from_an_empty_row_takes_the_window_out_of_its_row() {
+    let (harness, commands) = display_move_from_an_empty_row(MoveFocus::Follow);
+    harness
+        .on_iteration(3, |world, _state| {
+            assert_on_workspace!(world, 1, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 1, TEST_WORKSPACE_ID);
+            let row = row_entity(world, TEST_WORKSPACE_ID, 0);
+            let rest = [0, 2].map(|id| find_window_entity(id, world));
+            assert_eq!(row_windows(world, row), rest);
+        })
+        .run(commands);
+}
+
+/// Sending from an empty row keeps the laptop on that empty row and focus on
+/// the moved window; the parked row it left remembers the successor. Focusing
+/// the successor would show that row again, and the move check would pull the
+/// window back into it before macOS lands the move.
+#[test]
+fn test_send_from_an_empty_row_keeps_the_view_and_remembers_the_successor() {
+    let (harness, mut commands) = display_move_from_an_empty_row(MoveFocus::Stay);
+    commands.push(virtual_number(0));
+    commands.extend(idle(1));
+
+    harness
+        .on_iteration(3, |world, state| {
+            let window = find_window_entity(1, world);
+            let holders = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|strip| strip.contains(window))
+                .count();
+            assert_eq!(holders, 1, "window 1 is in exactly one row");
+            assert_on_workspace!(world, 1, EXT_WORKSPACE_ID);
+            assert_focused!(world, 1);
+            let row = row_entity(world, TEST_WORKSPACE_ID, 1);
+            assert!(
+                world.get::<ActiveWorkspaceMarker>(row).is_some(),
+                "the laptop still shows the empty row 1"
+            );
+            let successor = find_window_entity(2, world);
+            assert_eq!(
+                world
+                    .resource::<FocusHistory>()
+                    .last_managed(TEST_WORKSPACE_ID),
+                Some(successor)
+            );
+            // macOS lands the move.
+            state.update_window(1, |window| window.workspace_id = EXT_WORKSPACE_ID);
+        })
+        .on_iteration(5, |world, _state| {
+            assert_back_on_row_0_focuses_the_successor(world);
+        })
+        .run(commands);
+}
+
+/// Following from an empty row: back on the laptop, its row 0 focuses the
+/// successor it saved, not the window that left.
+#[test]
+fn test_follow_from_an_empty_row_leaves_the_successor_for_the_row_it_left() {
+    let (harness, mut commands) = display_move_from_an_empty_row(MoveFocus::Follow);
+    commands.push(Event::Command {
+        command: Command::Mouse(MouseMove::ToDisplay(Direction::South)),
+    });
+    commands.push(virtual_number(0));
+    commands.extend(idle(1));
+
+    harness
+        .on_iteration(3, |world, state| {
+            assert_focused!(world, 1);
+            // macOS lands the move.
+            state.update_window(1, |window| window.workspace_id = EXT_WORKSPACE_ID);
+        })
+        .on_iteration(6, |world, _state| {
+            assert_back_on_row_0_focuses_the_successor(world);
+        })
+        .run(commands);
+}
+
+/// A window left in a second row (an earlier bug, or startup) leaves that row
+/// too when it moves to another display.
+#[test]
+fn test_display_move_takes_the_window_out_of_every_row() {
+    let mut commands = idle(1);
+    commands.push(virtual_number(1));
+    commands.push(virtual_number(0));
+    commands.extend(idle(1));
+    commands.push(to_next_display(MoveFocus::Follow));
+
+    three_windows_below_an_empty_display()
+        .on_iteration(0, |_world, state| state.focus_window(1))
+        .on_iteration(3, |world, _state| {
+            assert_focused!(world, 1);
+            let window = find_window_entity(1, world);
+            let row = row_entity(world, TEST_WORKSPACE_ID, 1);
+            world
+                .get_mut::<LayoutStrip>(row)
+                .expect("row 1")
+                .append(window);
+        })
+        .on_iteration(4, |world, _state| {
+            assert_on_workspace!(world, 1, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 1, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// WSD-8: with reaping and dynamic rows off, a hot-plug keeps the 4 pre-made
+/// rows, whether the Space keeps windows or loses them all.
+#[test]
+fn test_display_hot_plug_keeps_pre_made_rows() {
+    let config =
+        Config::try_from("default_workspaces = 4\n[options]\n[bindings]\n").expect("config parses");
+    let mut commands = idle(5);
+    commands[3] = Event::DisplayAdded {
+        display_id: EXT_DISPLAY_ID,
+    };
+    commands[4] = Event::DisplayConfigured {
+        display_id: EXT_DISPLAY_ID,
+    };
+
+    let mut harness = TestHarness::new().with_config(config);
+    harness
+        .app
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            500,
+        )));
+    harness
+        .on_iteration(1, |world, state| {
+            // After startup, so they sit in row 0 only.
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let windows =
+                [0, 1].map(|id| state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, id, frame));
+            world.trigger(SpawnWindowTrigger(windows.into()));
+        })
+        .on_iteration(2, |world, mut state| {
+            let [w0, w1] = [0, 1].map(|id| find_window_entity(id, world));
+            let rows = rows_of(world, TEST_WORKSPACE_ID);
+            assert_eq!(rows.len(), 4, "4 pre-made rows: {rows:?}");
+            let first = &rows[0].1;
+            assert!(
+                first.len() == 2 && first.contains(&w0) && first.contains(&w1),
+                "row 0 holds both windows: {first:?}"
+            );
+            assert!(rows[1..].iter().all(|row| row.1.is_empty()));
+
+            state.add_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID]);
+            state.update_window(1, |window| window.workspace_id = EXT_WORKSPACE_ID);
+        })
+        .on_iteration(3, |world, state| {
+            assert_on_workspace!(world, 1, EXT_WORKSPACE_ID);
+            let w0 = find_window_entity(0, world);
+            assert_eq!(
+                rows_of(world, TEST_WORKSPACE_ID),
+                [
+                    (0, vec![w0], true),
+                    (1, vec![], false),
+                    (2, vec![], false),
+                    (3, vec![], false)
+                ],
+                "the populated row stays first and the empty ones are kept"
+            );
+            state.update_window(0, |window| window.workspace_id = EXT_WORKSPACE_ID);
+        })
+        .on_iteration(4, |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_eq!(
+                rows_of(world, TEST_WORKSPACE_ID),
+                [
+                    (0, vec![], true),
+                    (1, vec![], false),
+                    (2, vec![], false),
+                    (3, vec![], false)
+                ],
+                "a Space left with no windows keeps every row"
+            );
+        })
+        .run(commands);
+}
+
+/// WSD-9: when two windows move to the laptop's Space together (the batch
+/// path), a window just launched on the Dell and still settling stays there,
+/// though macOS still lists it on the laptop.
+#[test]
+fn test_batch_move_leaves_a_settling_launched_window() {
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID])
+        .with_windows(1)
+        .with_workspace_window(200, EXT_WORKSPACE_ID, |_| {})
+        .with_workspace_window(201, EXT_WORKSPACE_ID, |_| {})
+        .with_workspace_window(202, EXT_WORKSPACE_ID, |_| {})
+        .on_iteration(0, |_world, state| state.focus_window(200))
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 200);
+            let now = world.resource::<Time>().elapsed();
+            let launched = find_window_entity(202, world);
+            world
+                .entity_mut(launched)
+                .insert(crate::ecs::LaunchedInto(now));
+            for id in [200, 201, 202] {
+                state.update_window(id, |window| window.workspace_id = TEST_WORKSPACE_ID);
+            }
+            // Activates the laptop row, so its moved-window check runs.
+            state.focus_window(0);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_on_workspace!(world, 200, TEST_WORKSPACE_ID);
+            assert_on_workspace!(world, 201, TEST_WORKSPACE_ID);
+            assert_on_workspace!(world, 202, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 202, TEST_WORKSPACE_ID);
+        })
+        .run(idle(3));
 }

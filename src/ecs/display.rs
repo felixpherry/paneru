@@ -22,12 +22,12 @@ use tracing::{Level, debug, error, instrument, warn};
 
 use crate::config::Config;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::workspace::PreviousStripPosition;
+use crate::ecs::workspace::{PreviousStripPosition, moved_from_another_row};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, EnsureVisibleMarker, FocusedMarker, LayoutPosition,
-    ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties, RepositionMarker,
-    SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
-    VerifyWindowSize,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, EnsureVisibleMarker, FocusedMarker, LaunchedInto,
+    LayoutPosition, ManualStripOffset, NativeFullscreenMarker, Position, ReadDisplayProperties,
+    RepositionMarker, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout,
+    Unmanaged, VerifyWindowSize,
 };
 use crate::events::Event;
 use crate::manager::{Display, Origin, Window, WindowManager, irect_from};
@@ -351,23 +351,25 @@ fn migrate_moved_windows_to_space(
         return;
     }
 
+    // Listed in this Space, in none of its rows, and moved from another row:
+    // the same rule as detect_moved_windows' single path.
     let moved_entities: EntityHashSet = {
+        let now = world.resource::<Time>().elapsed();
         let mut strip_query = world.query::<(&LayoutStrip, Has<NativeFullscreenMarker>)>();
-        let strips_in_space: Vec<&LayoutStrip> = strip_query
-            .iter(world)
-            .filter_map(|(strip, _)| (strip.id() == target_space_id).then_some(strip))
-            .collect();
-        let fullscreen_strips: Vec<&LayoutStrip> = strip_query
-            .iter(world)
-            .filter_map(|(strip, fullscreen)| fullscreen.then_some(strip))
-            .collect();
-
+        let strips: Vec<(&LayoutStrip, bool)> = strip_query.iter(world).collect();
         win_ids
             .into_iter()
             .filter_map(|id| managed_windows.get(&id).copied())
             .filter(|&entity| {
-                !strips_in_space.iter().any(|strip| strip.contains(entity))
-                    && !fullscreen_strips.iter().any(|strip| strip.contains(entity))
+                !strips
+                    .iter()
+                    .any(|(strip, _)| strip.id() == target_space_id && strip.contains(entity))
+                    && moved_from_another_row(
+                        entity,
+                        strips.iter().copied(),
+                        world.get::<LaunchedInto>(entity),
+                        now,
+                    )
             })
             .collect()
     };
@@ -485,9 +487,11 @@ fn place_extracted_strip(
     }
 }
 
-/// Removes emptied virtual workspace strips on `workspace_id` and compacts the
-/// remaining `virtual_index` sequence from `0` so that a workspace with
-/// remaining windows never ends up with an empty first workspace (`virtual_index = 0`).
+/// Renumbers the rows of `workspace_id` from `0`, populated rows first, so a
+/// Space with windows never shows an empty row 0. While the Space has a display
+/// no row is removed: dropping empty rows is the reap or dynamic rule's job,
+/// and both are off by default (WSD-8). A Space with no display loses its rows.
+/// Native fullscreen rows are left alone.
 pub(crate) fn compact_workspace_strips(world: &mut World, workspace_id: WorkspaceId) {
     let mut rows: Vec<(Entity, u32, usize, bool, bool, Option<Entity>)> = world
         .query::<(
@@ -520,49 +524,41 @@ pub(crate) fn compact_workspace_strips(world: &mut World, workspace_id: Workspac
     let space_has_display = rows.iter().any(|(_, _, _, _, _, parent)| parent.is_some());
 
     if has_populated {
-        let mut had_active = false;
-        let mut had_selected = false;
-        let mut populated_rows = Vec::new();
-
-        for (entity, _, len, active, selected, parent) in rows {
-            if len == 0 {
-                had_active |= active;
-                had_selected |= selected;
-                world.despawn(entity);
-            } else {
-                populated_rows.push((entity, active, selected, parent));
-            }
-        }
-
-        for (idx, (entity, _, _, _)) in populated_rows.iter().enumerate() {
-            if let Some(mut strip) = world.get_mut::<LayoutStrip>(*entity) {
-                strip.virtual_index = u32::try_from(idx).unwrap_or(0);
-            }
-        }
-
-        let any_selected = populated_rows.iter().any(|(_, _, selected, _)| *selected);
+        // Populated rows first, keeping their order, then the empty ones.
+        let (populated, empty): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| row.2 > 0);
+        let had_active = empty.iter().any(|row| row.3);
+        let had_selected = empty.iter().any(|row| row.4);
+        let any_selected = populated.iter().any(|row| row.4);
+        renumber_rows(world, populated.iter().chain(&empty).map(|row| row.0));
+        // An empty row that was shown hands its markers to the first populated
+        // one; the marker observers take them off the empty row.
         if (had_active || had_selected || !any_selected)
-            && let Some(&(first_entity, _, _, parent)) = populated_rows.first()
+            && let Some(&(first_entity, .., parent)) = populated.first()
         {
             promote_strip_to_first(world, first_entity, parent, true, had_active);
         }
     } else if !space_has_display {
-        for (entity, _, _, _, _, _) in rows {
+        for (entity, ..) in rows {
             world.despawn(entity);
         }
     } else {
-        let (first_entity, _, _, _, _, parent) = rows[0];
-        let mut had_active = false;
-        let mut had_selected = false;
-        for &(entity, _, _, active, selected, _) in &rows[1..] {
-            had_active |= active;
-            had_selected |= selected;
-            world.despawn(entity);
-        }
-        if let Some(mut strip) = world.get_mut::<LayoutStrip>(first_entity) {
-            strip.virtual_index = 0;
-        }
+        // Nothing populated: keep every row and show the first, as before.
+        let had_active = rows[1..].iter().any(|row| row.3);
+        let had_selected = rows[1..].iter().any(|row| row.4);
+        renumber_rows(world, rows.iter().map(|row| row.0));
+        let (first_entity, .., parent) = rows[0];
         promote_strip_to_first(world, first_entity, parent, had_selected, had_active);
+    }
+}
+
+/// Numbers `rows` `0..n` in order, writing only the ones that change.
+fn renumber_rows(world: &mut World, rows: impl Iterator<Item = Entity>) {
+    for (index, entity) in (0u32..).zip(rows) {
+        if let Some(mut strip) = world.get_mut::<LayoutStrip>(entity)
+            && strip.virtual_index != index
+        {
+            strip.virtual_index = index;
+        }
     }
 }
 

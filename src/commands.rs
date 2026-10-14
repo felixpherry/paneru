@@ -2,7 +2,7 @@ use bevy::app::{PostUpdate, PreUpdate};
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::query::{Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{on_message, resource_changed};
 use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
@@ -21,7 +21,7 @@ use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
 };
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
-use crate::ecs::workspace::column_closest_to_center;
+use crate::ecs::workspace::{PreviousStripPosition, column_closest_to_center};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, FullWidthMarker,
     ManualStripOffset, NativeFullscreenMarker, OpenedBeside, RaiseWindow, SelectedVirtualMarker,
@@ -36,13 +36,18 @@ pub use crate::types::commands::{
     Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
 };
 
-/// The strips that are selected on their display but not the one on screen —
-/// the parked virtual workspaces a window can be handed off to.
-type OffscreenStrips<'w, 's> = Query<
+/// Every row, with whether it is on screen, whether it is its display's
+/// selected row, and whether it has a display.
+type RowsWithVisibility<'w, 's> = Query<
     'w,
     's,
-    (&'static mut LayoutStrip, &'static ChildOf),
-    (With<SelectedVirtualMarker>, Without<ActiveWorkspaceMarker>),
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+        Has<ChildOf>,
+    ),
 >;
 
 /// Every strip alongside the two flags that say where it sits: whether it is the
@@ -1153,15 +1158,16 @@ fn copy_window_rule(
 /// first other display for `ToNextDisplay`, or the nearest one in a direction
 /// for `ToDisplay`. Like a virtual workspace move, it lands as a new column
 /// right of the target row's active column, sized for the target viewport.
+/// It leaves every row it was in, including a parked one focus was left on.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    mut source_strip: Single<&mut LayoutStrip, With<ActiveWorkspaceMarker>>,
     displays: Query<(&Display, Option<&DockPosition>, Has<ActiveDisplayMarker>)>,
-    mut other_workspaces: OffscreenStrips,
+    mut rows: RowsWithVisibility,
     opened_beside: Query<&OpenedBeside>,
+    mut saved_focus: Query<&mut PreviousStripPosition>,
     mut focus_history: ResMut<FocusHistory>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
@@ -1212,11 +1218,26 @@ fn to_next_display(
     let Ok(target_space_id) = window_manager.active_display_space(target.id()) else {
         return;
     };
-    let Some((mut target_strip, _)) = other_workspaces
-        .iter_mut()
-        .find(|(strip, _)| strip.id() == target_space_id)
+    // The target: its display's selected row, not the one on screen.
+    let Some(target_row) = rows
+        .iter()
+        .find(|(_, strip, active, selected, parented)| {
+            *selected && !*active && *parented && strip.id() == target_space_id
+        })
+        .map(|(row, ..)| row)
     else {
         debug!("no selected strip on display {}.", target.id());
+        return;
+    };
+    // The row that really holds the window: the one on screen, unless focus was
+    // left on a window of a parked row by switching to an empty one (WSD-6).
+    let Some((source_row, source_shown)) = rows
+        .iter()
+        .filter(|(row, strip, ..)| *row != target_row && strip.contains(entity))
+        .min_by_key(|(_, _, active, ..)| !*active)
+        .map(|(row, _, active, ..)| (row, active))
+    else {
+        debug!("window {entity} is in no row to move from.");
         return;
     };
     debug!(
@@ -1225,27 +1246,55 @@ fn to_next_display(
         target.id()
     );
 
-    let moving = source_strip
-        .tab_group(entity)
+    let moving = rows
+        .get(source_row)
+        .ok()
+        .and_then(|(_, strip, ..)| strip.tab_group(entity))
         .unwrap_or_else(|| vec![entity]);
+    // Out of any other row it was left in, so it never ends up in two. Only rows
+    // holding one are touched: `remove` marks a row changed even when it is a no-op.
+    for (row, mut strip, ..) in &mut rows {
+        if row != source_row
+            && row != target_row
+            && moving.iter().any(|member| strip.contains(*member))
+        {
+            for member in &moving {
+                strip.remove(*member);
+            }
+        }
+    }
+    let Ok([(_, mut source_strip, ..), (_, mut target_strip, ..)]) =
+        rows.get_many_mut([source_row, target_row])
+    else {
+        return;
+    };
     // The rest of its tab group first, so the focused window leaves as a lone
     // column and hands off by the rule (a native tab never hands off).
     for member in moving.iter().filter(|&&member| member != entity) {
         source_strip.remove(*member);
     }
     // Follow: the source Space now remembers the successor, too.
-    if let Some(next) = leave_row(
+    let next = leave_row(
         &mut source_strip,
         entity,
         &mut focus_history,
         time.elapsed(),
         Some(entity),
         opened_beside.get(entity).ok().map(|beside| beside.0),
-    ) {
+    );
+    if let Some(next) = next {
         commands.reshuffle_around(next);
-        if matches!(move_focus, MoveFocus::Stay) {
+        // Stay from a parked row: the history above remembers the successor,
+        // but focusing it would show that row again, and the move-detection
+        // check would pull the window back into it before macOS lands the move.
+        if matches!(move_focus, MoveFocus::Stay) && source_shown {
             commands.focus_entity(next, false);
         }
+    }
+    // A parked row focuses its saved window when shown again: make that the
+    // successor, as a virtual move does, not the window that just left.
+    if !source_shown && let Ok(mut parked) = saved_focus.get_mut(source_row) {
+        parked.focus = next;
     }
     // Its anchor stays behind on the source row.
     if let Ok(mut entity_commands) = commands.get_entity(entity) {

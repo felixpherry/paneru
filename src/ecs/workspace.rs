@@ -466,20 +466,19 @@ fn detect_moved_windows(
         return;
     }
 
-    // Only windows tiled elsewhere moved here. One in no strip is new and
-    // apply_window_positions has yet to tile it, possibly on another display,
-    // and one just tiled there is still listed here until its move lands. A
-    // native fullscreen window has a space of its own.
+    // Only windows tiled elsewhere moved here; see moved_from_another_row.
     let moved_set: bevy::ecs::entity::EntityHashSet = moved_windows
         .iter()
         .copied()
         .filter(|&entity| {
-            workspaces
-                .iter()
-                .any(|(strip, _, fullscreen, _)| !fullscreen && strip.contains(entity))
-                && !launched
-                    .get(entity)
-                    .is_ok_and(|launched| launched.settling(time.elapsed()))
+            moved_from_another_row(
+                entity,
+                workspaces
+                    .iter()
+                    .map(|(strip, _, fullscreen, _)| (strip, fullscreen)),
+                launched.get(entity).ok(),
+                time.elapsed(),
+            )
         })
         .collect();
     if moved_set.is_empty() {
@@ -519,6 +518,23 @@ fn detect_moved_windows(
             }
         }
     }
+}
+
+/// Whether `entity`, listed on a Space none of whose rows hold it, moved there
+/// from another row: it sits in a row elsewhere that isn't a native fullscreen
+/// row, and it isn't a launched window still settling. A window in no row is
+/// new (`apply_window_positions` tiles it) or stray (`adopt_stray_windows`
+/// does). A native fullscreen window has a Space of its own. A settling one is
+/// still listed on the Space it opened on until its move lands (6bf2ea4).
+/// `strips` pairs every row with whether it has a `NativeFullscreenMarker`.
+pub(crate) fn moved_from_another_row<'a>(
+    entity: Entity,
+    mut strips: impl Iterator<Item = (&'a LayoutStrip, bool)>,
+    launched: Option<&LaunchedInto>,
+    now: Duration,
+) -> bool {
+    strips.any(|(strip, fullscreen)| !fullscreen && strip.contains(entity))
+        && !launched.is_some_and(|launched| launched.settling(now))
 }
 
 fn is_batch_workspace_move(
