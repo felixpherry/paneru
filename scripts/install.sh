@@ -15,7 +15,12 @@ cargo install --path . --locked "$@"
 # Pattern matches, not `| grep -q`: under pipefail an early grep exit can
 # fail the pipeline even on a match.
 if [[ $(security find-identity -p codesigning) == *"\"$IDENTITY\""* ]]; then
-  codesign --force --sign "$IDENTITY" --identifier "$LABEL" "$BIN"
+  codesign --force --sign "$IDENTITY" --identifier "$LABEL" "$BIN" || {
+    # errSecInternalComponent: the keychain is locked or its prompt timed out.
+    echo "error: signing failed; the daemon was not restarted. Unlock the login" >&2
+    echo "       keychain (click \"Always Allow\" on its prompt) and re-run." >&2
+    exit 1
+  }
 else
   echo "warning: no '$IDENTITY' code-signing certificate, so $BIN stays ad-hoc signed" >&2
   echo "         and macOS drops its Accessibility and Screen Recording grants on every" >&2
