@@ -156,8 +156,13 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn sign_bundle(app_path: &Path) -> Result<()> {
+    // The identity scripts/install.sh signs Paneru with; ad-hoc without one.
+    let identity = env::var("PANERU_CODESIGN_IDENTITY")
+        .ok()
+        .filter(|identity| !identity.is_empty())
+        .unwrap_or_else(|| "-".to_string());
     let output = Command::new("/usr/bin/codesign")
-        .args(["--force", "--deep", "--sign", "-"])
+        .args(["--force", "--deep", "--sign", &identity])
         .arg(app_path)
         .output()?;
     if output.status.success() {

@@ -948,34 +948,43 @@ pub fn request_ax_privilege() -> bool {
     }
 }
 
-/// Resets the TCC Accessibility entry for Paneru (`com.github.karinushka.paneru`).
+/// Resets Paneru's TCC Accessibility and Screen Recording entries
+/// (`com.github.karinushka.paneru`).
 ///
-/// Rebuilding the binary or switching between Homebrew and Cargo changes the
-/// ad-hoc code-signing hash (`cdhash`), leaving a stale TCC entry that
-/// prevents macOS from honoring the existing toggle or re-displaying the
-/// system prompt until the entry is cleared.
+/// An unsigned rebuild (see `scripts/install.sh`) or switching between
+/// Homebrew and Cargo changes the code signature, leaving stale entries for
+/// both that stop macOS from honoring the toggles or re-prompting until
+/// they are cleared.
 pub fn reset_ax_privilege() -> bool {
+    let accessibility = reset_tcc_entry("Accessibility");
+    let screen_capture = reset_tcc_entry("ScreenCapture");
+    accessibility && screen_capture
+}
+
+fn reset_tcc_entry(service: &str) -> bool {
     match std::process::Command::new("/usr/bin/tccutil")
-        .args(["reset", "Accessibility", crate::platform::service::ID])
+        .args(["reset", service, crate::platform::service::ID])
         .output()
     {
         Ok(output) if output.status.success() => {
             info!(
+                service,
                 bundle_id = crate::platform::service::ID,
-                "reset TCC Accessibility entry"
+                "reset TCC entry"
             );
             true
         }
         Ok(output) => {
             warn!(
+                service,
                 status = %output.status,
                 stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                "tccutil reset Accessibility failed"
+                "tccutil reset failed"
             );
             false
         }
         Err(error) => {
-            warn!(%error, "unable to run tccutil to reset Accessibility entry");
+            warn!(service, %error, "unable to run tccutil");
             false
         }
     }

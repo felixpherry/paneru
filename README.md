@@ -135,6 +135,35 @@ $ cargo build --release --no-default-features --features lua
 It can run directly from the command line or as a service.
 Note that you will need to grant accessibility privileges to the binary.
 
+### Keeping permissions across rebuilds
+
+macOS ties the Accessibility and Screen Recording grants to the binary's code
+signature. `cargo install` signs ad hoc, so every rebuild looks like a new app
+and the grants are lost. Sign with a stable self-signed certificate instead.
+
+One-time setup, as for yabai:
+
+1. Open Keychain Access › Certificate Assistant › Create a Certificate…
+2. Name it `paneru-dev`, set Identity Type to "Self Signed Root" and Certificate
+   Type to "Code Signing", then click Create.
+
+Then install from the source checkout with:
+
+```shell
+$ scripts/install.sh            # extra arguments go to cargo install
+```
+
+The script runs `cargo install --path . --locked`, signs
+`~/.cargo/bin/paneru` with the certificate under the identifier
+`com.github.karinushka.paneru`, restarts the service, and prints the
+signature. Without the certificate it warns and leaves the binary ad-hoc
+signed. Grant Accessibility and Screen Recording once after the first signed
+install; later installs keep them. If the first signing asks for keychain
+access, choose "Always Allow".
+
+Set `PANERU_CODESIGN_IDENTITY` to use another certificate name.
+`paneru install-app` signs the launcher with it too.
+
 ### Installing with Homebrew
 
 If you are using Homebrew, you can install from the formula with:

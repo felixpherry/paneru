@@ -221,6 +221,13 @@ fn main() -> Result<()> {
             if !check_ax_privilege() && !wait_for_accessibility(sender.clone(), &receiver) {
                 return Ok(());
             }
+            // Capture stays best effort; this only says why tiles show icons.
+            #[cfg(feature = "thumbnails")]
+            if !objc2_core_graphics::CGPreflightScreenCaptureAccess() {
+                warn!(
+                    "Screen Recording permission is not granted: overview thumbnails fall back to app icons until it is."
+                );
+            }
             match objc2::rc::autoreleasepool(|_| setup_bevy_app(sender, receiver)) {
                 Ok(mut app) => {
                     app.run();
