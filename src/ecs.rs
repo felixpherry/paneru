@@ -267,7 +267,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(on_timer(LOW_POWER_MODE_CHECK)),
             systems::cleanup_on_exit,
             restore::tick_restore_grace,
-            state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
+            state::periodic_state_save
+                .run_if(on_timer(Duration::from_mins(5)))
+                .run_if(|guard: state::SaveGuard| guard.blocked_by().is_none()),
             state::cleanup_on_exit,
             script_state::periodic_script_state_save.run_if(on_timer(Duration::from_mins(5))),
             script_state::script_state_cleanup_on_exit,

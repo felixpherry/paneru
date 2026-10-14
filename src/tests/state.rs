@@ -14,8 +14,8 @@ use crate::events::Event;
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::tests::{
-    TEST_DISPLAY_HEIGHT, TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT,
-    TEST_WORKSPACE_ID,
+    EXT_DISPLAY_HEIGHT, EXT_DISPLAY_ID, EXT_DISPLAY_WIDTH, EXT_WORKSPACE_ID, TEST_DISPLAY_HEIGHT,
+    TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT, TEST_WORKSPACE_ID,
 };
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::query::Has;
@@ -731,26 +731,59 @@ fn test_query_state_assigns_float_only_to_active_row() {
     assert_eq!(active.windows[0].window_id, 0);
 }
 
-#[test]
-fn test_query_state_propagates_workspace_query_failure() {
+/// Two displays with window 0 on the main one, after which the external
+/// display's Space can't be read. Both rows are read: the main one is active,
+/// the external one selected.
+fn harness_with_unreadable_ext_space() -> crate::tests::harness::TestHarness {
     use crate::errors::Error;
     use crate::manager::MockWindowManagerApi;
-    use crate::tests::harness::TestHarness;
 
-    let mut harness = TestHarness::new().with_windows(1);
+    let mut harness = crate::tests::harness::TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(1);
     harness.app.update();
 
     let mut window_manager = MockWindowManagerApi::new();
     window_manager
         .expect_windows_in_workspace()
-        .returning(|_| Err(Error::Generic("workspace query failed".to_string())));
+        .returning(|space| {
+            if space == EXT_WORKSPACE_ID {
+                Err(Error::Generic("workspace query failed".to_string()))
+            } else {
+                Ok(vec![])
+            }
+        });
     harness
         .world()
         .insert_resource(WindowManager(Box::new(window_manager)));
+    harness
+}
 
-    let error = extract_query_state(harness.world()).expect_err("workspace query should fail");
+/// One unreadable Space is skipped, so queries and broadcasts keep working.
+#[test]
+fn test_query_state_skips_unreadable_workspace() {
+    let mut harness = harness_with_unreadable_ext_space();
 
-    assert_eq!(error.to_string(), "Generic error: workspace query failed");
+    let state =
+        extract_query_state(harness.world()).expect("an unreadable Space is skipped, not fatal");
+
+    let windows_of = |space: WorkspaceId| {
+        state
+            .virtual_workspaces
+            .iter()
+            .find(|workspace| workspace.native_workspace_id == space)
+            .unwrap_or_else(|| panic!("Space {space} missing from query state"))
+            .windows
+            .iter()
+            .map(|window| window.window_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(windows_of(TEST_WORKSPACE_ID), [0]);
+    assert!(windows_of(EXT_WORKSPACE_ID).is_empty());
 }
 
 #[test]
@@ -900,6 +933,20 @@ fn test_window_set_keeps_the_column_structure_a_flat_query_loses() {
     assert_eq!(set.east(leftmost), Some(middle));
     assert_eq!(set.west(middle), Some(leftmost));
     assert_eq!(set.column_of(middle), Some(1));
+}
+
+/// One unreadable Space is skipped, so Lua binds keep working.
+#[cfg(feature = "lua")]
+#[test]
+fn test_window_set_skips_unreadable_workspace() {
+    let mut harness = harness_with_unreadable_ext_space();
+
+    let set =
+        extract_window_set(harness.world()).expect("an unreadable Space is skipped, not fatal");
+
+    assert_eq!(set.displays().len(), 2);
+    let workspace = set.current().expect("an active workspace");
+    assert_eq!(workspace.columns.len(), 1);
 }
 
 #[cfg(feature = "lua")]

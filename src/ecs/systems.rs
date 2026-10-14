@@ -107,19 +107,32 @@ const PUMP_MAX_EVENTS: usize = 256;
 
 /// Gathers all present displays and spawns them as entities in the Bevy world.
 /// The currently active display (identified by `window_manager.active_display_id()`) is marked with `ActiveDisplayMarker`.
+/// A failed or partial scan (no active Space, no displays, or a display whose
+/// Spaces can't be read) still spawns what it can and triggers a reconcile,
+/// whose retries rebuild the rest.
 ///
 /// # Arguments
 ///
 /// * `window_manager` - The `WindowManager` resource for querying display information.
 /// * `commands` - Bevy commands to spawn entities.
 pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Commands) {
-    let Ok(active_display_id) = window_manager.active_display_id() else {
-        error!("Unable to get active display id!");
-        return;
-    };
-    for (display, workspaces) in window_manager.present_displays() {
+    let active_display_id = window_manager
+        .active_display_id()
+        .inspect_err(|err| error!("Unable to get active display id: {err}"))
+        .ok();
+    let active_space = active_display_id.and_then(|id| {
+        window_manager
+            .active_display_space(id)
+            .inspect_err(|err| warn!("Unable to read the current space of display {id}: {err}"))
+            .ok()
+    });
+    let displays = window_manager.present_displays();
+    let mut incomplete = active_space.is_none() || displays.is_empty();
+
+    for (display, workspaces) in displays {
+        incomplete |= workspaces.is_empty();
         let origin = Position(display.bounds().min);
-        let entity = if display.id() == active_display_id {
+        let entity = if Some(display.id()) == active_display_id {
             commands.spawn((display, ActiveDisplayMarker))
         } else {
             commands.spawn(display)
@@ -128,15 +141,19 @@ pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Command
 
         commands.trigger(ReadDisplayProperties(entity));
 
-        let Ok(active_space) = window_manager.active_display_space(active_display_id) else {
-            return;
-        };
-
         for id in workspaces {
-            let active = id == active_space;
+            let active = Some(id) == active_space;
             commands.spawn_layout_strip(LayoutStrip::new(id, 0), origin.0, entity, active);
             commands.spawn((FloatingLayer::new(id), ChildOf(entity)));
         }
+    }
+
+    if incomplete {
+        // Reconcile's settle-and-retry rebuilds whatever this scan missed.
+        warn!("Startup display scan is incomplete; asking reconcile to retry");
+        commands.trigger(SendMessageTrigger(Event::DisplayConfigured {
+            display_id: active_display_id.unwrap_or_default(), // reconcile ignores the id
+        }));
     }
 }
 

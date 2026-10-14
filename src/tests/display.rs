@@ -6,7 +6,9 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::{ActiveDisplayMarker, DockPosition, SpawnWindowTrigger, Timeout};
+use crate::ecs::{
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, SpawnWindowTrigger, Timeout,
+};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WinID;
@@ -2123,4 +2125,281 @@ fn test_remove_display_populates_empty_first_workspace_on_surviving_display() {
             );
         })
         .run(commands);
+}
+
+/// A Space that no display lists any more (P1–P4).
+const DEAD_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+fn main_bounds() -> IRect {
+    IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT)
+}
+
+fn ext_bounds() -> IRect {
+    IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0)
+}
+
+/// Startup can't read the external display's Spaces. Once the read works, the
+/// retry must give that display its row.
+#[test]
+fn startup_retries_a_display_whose_spaces_cannot_be_read() {
+    let harness =
+        TestHarness::new().with_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID]);
+    harness
+        .mock_state
+        .set_space_list_unreadable(EXT_DISPLAY_ID, true);
+    harness
+        .on_iteration(0, |world, state| {
+            let main = display_entity(world, TEST_DISPLAY_ID);
+            assert_eq!(row_parents(world, TEST_WORKSPACE_ID), [Some(main)]);
+            assert!(
+                row_parents(world, EXT_WORKSPACE_ID).is_empty(),
+                "not read yet"
+            );
+            state.set_space_list_unreadable(EXT_DISPLAY_ID, false);
+        })
+        .on_iteration(3, |world, _state| {
+            let ext = display_entity(world, EXT_DISPLAY_ID);
+            assert_eq!(
+                row_parents(world, EXT_WORKSPACE_ID),
+                [Some(ext)],
+                "the retry gives the display its row"
+            );
+        })
+        .run(idle(4));
+}
+
+/// Startup sees no display at all. Once macOS reports one, the retry must
+/// build it with both active markers.
+#[test]
+fn startup_rebuilds_the_world_after_an_empty_display_scan() {
+    let harness = TestHarness::new();
+    harness.mock_state.remove_display(TEST_DISPLAY_ID);
+    harness
+        .on_iteration(0, |world, mut state| {
+            assert_eq!(world.query::<&Display>().iter(world).count(), 0);
+            state.add_display(TEST_DISPLAY_ID, main_bounds(), vec![TEST_WORKSPACE_ID]);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_eq!(
+                world.query::<&Display>().iter(world).count(),
+                1,
+                "the retry spawns the display"
+            );
+            let main = display_entity(world, TEST_DISPLAY_ID);
+            assert!(world.get::<ActiveDisplayMarker>(main).is_some());
+            assert_eq!(row_parents(world, TEST_WORKSPACE_ID), [Some(main)]);
+            assert_eq!(active_space(world), Some(TEST_WORKSPACE_ID));
+        })
+        .run(idle(4));
+}
+
+/// The active Space can't be read at startup (the active display id names no
+/// display). Every display must still be scanned, and the retry sets the
+/// active markers once the read works.
+#[test]
+fn startup_keeps_scanning_displays_when_the_active_space_cannot_be_read() {
+    let harness =
+        TestHarness::new().with_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID]);
+    harness.mock_state.set_active_display(999);
+    harness
+        .on_iteration(0, |world, state| {
+            let main = display_entity(world, TEST_DISPLAY_ID);
+            let ext = display_entity(world, EXT_DISPLAY_ID);
+            assert_eq!(row_parents(world, TEST_WORKSPACE_ID), [Some(main)]);
+            assert_eq!(row_parents(world, EXT_WORKSPACE_ID), [Some(ext)]);
+            state.set_active_display(TEST_DISPLAY_ID);
+        })
+        .on_iteration(3, |world, _state| {
+            let main = display_entity(world, TEST_DISPLAY_ID);
+            assert!(world.get::<ActiveDisplayMarker>(main).is_some());
+            assert_eq!(active_space(world), Some(TEST_WORKSPACE_ID));
+        })
+        .run(idle(4));
+}
+
+/// Reconcile's retries run out while a display's Space list stays unreadable.
+/// Applying that scan must leave the display and its rows alone.
+#[test]
+fn reconcile_keeps_rows_of_a_display_whose_spaces_cannot_be_read() {
+    let first_ext = std::rc::Rc::new(std::cell::Cell::new(None));
+    let saved_ext = first_ext.clone();
+    let mut commands = idle(11);
+    commands[1] = Event::DisplayConfigured {
+        display_id: EXT_DISPLAY_ID,
+    };
+
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID])
+        .on_iteration(0, move |world, state| {
+            let ext = display_entity(world, EXT_DISPLAY_ID);
+            assert_eq!(row_parents(world, EXT_WORKSPACE_ID), [Some(ext)]);
+            saved_ext.set(Some(ext));
+            state.set_space_list_unreadable(EXT_DISPLAY_ID, true);
+        })
+        .on_iteration(10, move |world, _state| {
+            let ext = display_entity(world, EXT_DISPLAY_ID);
+            assert_eq!(Some(ext), first_ext.get(), "the display is the same entity");
+            assert_eq!(row_parents(world, EXT_WORKSPACE_ID), [Some(ext)]);
+            assert!(
+                !world
+                    .query::<(&LayoutStrip, Has<Timeout>)>()
+                    .iter(world)
+                    .any(|(strip, timeout)| strip.id() == EXT_WORKSPACE_ID && timeout),
+                "the row is not orphaned"
+            );
+        })
+        .run(commands);
+}
+
+/// A Space gone from a complete, consistent scan loses its rows.
+#[test]
+fn prune_removes_rows_of_a_space_no_display_lists() {
+    TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            main_bounds(),
+            vec![TEST_WORKSPACE_ID, DEAD_WORKSPACE_ID],
+        )
+        .on_iteration(0, |world, mut state| {
+            assert!(!row_parents(world, DEAD_WORKSPACE_ID).is_empty());
+            state.add_display(TEST_DISPLAY_ID, main_bounds(), vec![TEST_WORKSPACE_ID]);
+        })
+        .on_iteration(5, |world, _state| {
+            assert!(
+                row_parents(world, DEAD_WORKSPACE_ID).is_empty(),
+                "the dead Space's row is pruned"
+            );
+            assert_eq!(active_space(world), Some(TEST_WORKSPACE_ID));
+        })
+        .run(idle(6));
+}
+
+/// A scan with an unreadable display is partial: nothing is pruned.
+#[test]
+fn prune_keeps_rows_while_a_display_cannot_be_read() {
+    TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            main_bounds(),
+            vec![TEST_WORKSPACE_ID, DEAD_WORKSPACE_ID],
+        )
+        .with_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID])
+        .on_iteration(0, |_world, mut state| {
+            state.add_display(TEST_DISPLAY_ID, main_bounds(), vec![TEST_WORKSPACE_ID]);
+            state.set_space_list_unreadable(EXT_DISPLAY_ID, true);
+        })
+        .on_iteration(5, |world, _state| {
+            assert!(!row_parents(world, DEAD_WORKSPACE_ID).is_empty());
+            assert!(!row_parents(world, EXT_WORKSPACE_ID).is_empty());
+        })
+        .run(idle(6));
+}
+
+/// A scan whose display set differs from the world's is inconsistent (a
+/// display event still in flight): nothing is pruned.
+#[test]
+fn prune_keeps_rows_while_the_display_set_differs() {
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID])
+        .on_iteration(0, |_world, state| state.remove_display(EXT_DISPLAY_ID))
+        .on_iteration(5, |world, _state| {
+            let ext = display_entity(world, EXT_DISPLAY_ID);
+            assert_eq!(row_parents(world, EXT_WORKSPACE_ID), [Some(ext)]);
+        })
+        .run(idle(6));
+}
+
+/// Two displays listing the same Space (the "Main" identifier mix-up) make
+/// the scan inconsistent: nothing is pruned.
+#[test]
+fn prune_keeps_rows_when_two_displays_list_the_same_space() {
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID])
+        .on_iteration(0, |_world, mut state| {
+            state.add_display(EXT_DISPLAY_ID, ext_bounds(), vec![TEST_WORKSPACE_ID]);
+        })
+        .on_iteration(5, |world, _state| {
+            assert!(!row_parents(world, EXT_WORKSPACE_ID).is_empty());
+        })
+        .run(idle(6));
+}
+
+/// A display stays unreadable past reconcile's retries, so it is left with no
+/// rows. Once a scan reads it, the prune pass must ask reconcile to rebuild it.
+#[test]
+fn heal_rebuilds_a_display_unreadable_past_reconciles_retries() {
+    let harness =
+        TestHarness::new().with_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID]);
+    harness
+        .mock_state
+        .set_space_list_unreadable(EXT_DISPLAY_ID, true);
+    harness
+        .on_iteration(10, |world, state| {
+            assert!(!reconcile_pending(world), "reconcile has given up");
+            assert!(row_parents(world, EXT_WORKSPACE_ID).is_empty());
+            state.set_space_list_unreadable(EXT_DISPLAY_ID, false);
+        })
+        .on_iteration(14, |world, _state| {
+            let ext = display_entity(world, EXT_DISPLAY_ID);
+            assert_eq!(
+                row_parents(world, EXT_WORKSPACE_ID),
+                [Some(ext)],
+                "the heal gives the display its row"
+            );
+        })
+        .run(idle(15));
+}
+
+/// macOS reports no display past reconcile's retries, so the world stays
+/// empty. Once a display shows up, the prune pass must ask reconcile to build it.
+#[test]
+fn heal_rebuilds_a_world_left_empty_past_reconciles_retries() {
+    let harness = TestHarness::new();
+    harness.mock_state.remove_display(TEST_DISPLAY_ID);
+    harness
+        .on_iteration(10, |world, mut state| {
+            assert!(!reconcile_pending(world), "reconcile has given up");
+            assert_eq!(world.query::<&Display>().iter(world).count(), 0);
+            state.add_display(TEST_DISPLAY_ID, main_bounds(), vec![TEST_WORKSPACE_ID]);
+        })
+        .on_iteration(14, |world, _state| {
+            let main = display_entity(world, TEST_DISPLAY_ID);
+            assert!(world.get::<ActiveDisplayMarker>(main).is_some());
+            assert_eq!(row_parents(world, TEST_WORKSPACE_ID), [Some(main)]);
+            assert_eq!(active_space(world), Some(TEST_WORKSPACE_ID));
+        })
+        .run(idle(15));
+}
+
+fn reconcile_pending(world: &World) -> bool {
+    world
+        .resource::<crate::ecs::display::DisplayReconcileState>()
+        .is_pending()
+}
+
+/// The parent of every row of `space`: `Some(display)`, or `None` for an orphan.
+fn row_parents(world: &mut World, space: WorkspaceId) -> Vec<Option<Entity>> {
+    world
+        .query::<(&LayoutStrip, Option<&ChildOf>)>()
+        .iter(world)
+        .filter(|(strip, _)| strip.id() == space)
+        .map(|(_, child)| child.map(ChildOf::parent))
+        .collect()
+}
+
+fn display_entity(world: &mut World, id: u32) -> Entity {
+    world
+        .query::<(&Display, Entity)>()
+        .iter(world)
+        .find(|(display, _)| display.id() == id)
+        .map_or_else(|| panic!("display {id} not found"), |(_, entity)| entity)
+}
+
+/// The Space of the row marked active, if exactly one is.
+fn active_space(world: &mut World) -> Option<WorkspaceId> {
+    world
+        .query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .ok()
+        .map(LayoutStrip::id)
 }

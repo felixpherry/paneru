@@ -148,6 +148,14 @@ impl Plugin for WorkspaceEventsPlugin {
                 .run_if(on_timer(DISPLAY_CHANGE_CHECK_FREQ)),
         );
         app.add_systems(
+            PreUpdate,
+            prune_dead_space_rows
+                .in_set(super::PreUpdateSet::Dispatch)
+                .after(crate::ecs::display::reconcile_displays)
+                .run_if(on_timer(DISPLAY_CHANGE_CHECK_FREQ))
+                .run_if(not(resource_exists::<Initializing>)),
+        );
+        app.add_systems(
             Update,
             (
                 renumber_virtual_indexes,
@@ -653,6 +661,80 @@ fn windows_not_in_strips<F: Fn(WinID) -> Option<Entity>>(
             }
             (moved, unresolved)
         })
+}
+
+/// Removes the rows of a Space no display lists any more. Acts only when two
+/// consecutive scans are complete and consistent, so a passing glitch
+/// (reconfiguration, an unreadable display, the "Main" identifier mix-up)
+/// never deletes a live row. Parentless rows belong to
+/// [`find_orphaned_workspaces`]. Reuses the `SpaceDestroyed` path, which
+/// re-homes a fullscreen row's window before despawning.
+///
+/// Also heals a display reconcile gave up on: when a complete scan lists a
+/// display the world holds no rows for (unreadable or absent past the retries),
+/// it asks reconcile to rebuild once. A display the world has but the scan
+/// lacks is an unplug whose own event is in flight, so it is left alone.
+fn prune_dead_space_rows(
+    // Not `Populated`: the heal must also run in a world left with no rows.
+    rows: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<&Display>,
+    reconcile: Res<crate::ecs::display::DisplayReconcileState>,
+    window_manager: Res<WindowManager>,
+    mut suspects: Local<HashSet<WorkspaceId>>,
+    mut commands: Commands,
+) {
+    // Also makes the heal fire once: its reconcile is pending until it has run.
+    if reconcile.is_pending() {
+        suspects.clear();
+        return;
+    }
+    let scan = window_manager.present_displays();
+    let mut live = HashSet::new();
+    // An empty list is an unreadable display; a Space listed twice is the
+    // "Main" identifier mix-up. Either makes the scan untrustworthy.
+    let complete = !scan.is_empty()
+        && scan
+            .iter()
+            .all(|(_, spaces)| !spaces.is_empty() && spaces.iter().all(|&id| live.insert(id)));
+    if !complete {
+        suspects.clear();
+        return;
+    }
+
+    let with_rows: HashSet<_> = rows
+        .iter()
+        .filter_map(|(_, child)| displays.get(child.parent()).ok())
+        .map(Display::id)
+        .collect();
+    if let Some((display, _)) = scan
+        .iter()
+        .find(|(display, _)| !with_rows.contains(&display.id()))
+    {
+        let display_id = display.id();
+        warn!(
+            "Display {display_id} has no rows though its Spaces can be read; asking reconcile to rebuild"
+        );
+        suspects.clear();
+        commands.trigger(SendMessageTrigger(Event::DisplayConfigured { display_id }));
+        return;
+    }
+    let scanned: HashSet<_> = scan.iter().map(|(display, _)| display.id()).collect();
+    let known: HashSet<_> = displays.iter().map(Display::id).collect();
+    if scanned != known {
+        suspects.clear();
+        return;
+    }
+
+    let dead: HashSet<WorkspaceId> = rows
+        .iter()
+        .map(|(strip, _)| strip.id())
+        .filter(|id| !live.contains(id))
+        .collect();
+    for &space_id in dead.intersection(&suspects) {
+        warn!("Space {space_id} is gone from every display; removing its rows");
+        commands.trigger(SendMessageTrigger(Event::SpaceDestroyed { space_id }));
+    }
+    *suspects = dead;
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]

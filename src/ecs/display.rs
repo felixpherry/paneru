@@ -54,6 +54,11 @@ impl DisplayReconcileState {
     pub(crate) fn is_settling(&self) -> bool {
         self.pending.is_some() && self.verify_again
     }
+
+    /// A reconcile is scheduled (settling, retrying or verifying).
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
 }
 
 pub struct DisplayEventsPlugin;
@@ -234,6 +239,9 @@ pub(crate) fn reconcile_displays(
 
     // Displays that are still present: refresh their bounds (resolution or
     // menubar may have changed) and re-home any workspaces that drifted.
+    // A display whose Space list couldn't be read arrives with an empty list
+    // (see `present_displays`). Re-parenting then touches nothing, so it keeps
+    // its rows; never make this loop drop rows missing from `workspace_ids`.
     for display_id in present_ids.intersection(&existing_ids) {
         let Some((display, workspace_ids)) = present_displays.remove(display_id) else {
             continue;

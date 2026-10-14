@@ -17,7 +17,7 @@ use crate::platform::{ProcessSerialNumber, WorkspaceId};
 use crate::tests::{
     EXT_DISPLAY_HEIGHT, EXT_DISPLAY_ID, EXT_DISPLAY_WIDTH, EXT_WORKSPACE_ID, TEST_DISPLAY_HEIGHT,
     TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT, TEST_PROCESS_ID, TEST_WINDOW_HEIGHT,
-    TEST_WINDOW_WIDTH, TEST_WORKSPACE_ID, TestHarness, find_window_entity,
+    TEST_WINDOW_WIDTH, TEST_WORKSPACE_ID, TestHarness, find_window_entity, idle,
 };
 
 #[test]
@@ -436,6 +436,82 @@ fn test_restore_resource_is_removed_after_grace_period() {
             .contains_resource::<crate::ecs::restore::SessionRestore>()
     );
     assert!(!harness.app.world().contains_resource::<PaneruState>());
+}
+
+/// Whether the guard both state savers use refuses to save right now. Saver
+/// tests ask the guard, never the savers: those write the real state file.
+fn save_blocked(world: &mut World) -> bool {
+    use bevy::ecs::system::RunSystemOnce as _;
+    world
+        .run_system_once(|guard: crate::ecs::state::SaveGuard| guard.blocked_by().is_some())
+        .expect("guard runs")
+}
+
+#[test]
+fn state_save_is_blocked_while_no_display_exists() {
+    let harness = TestHarness::new();
+    harness.mock_state.remove_display(TEST_DISPLAY_ID);
+    harness
+        .on_iteration(0, |world, _state| {
+            assert_eq!(world.query::<&Display>().iter(world).count(), 0);
+            assert!(save_blocked(world), "an empty world must not be saved");
+        })
+        .run(idle(1));
+}
+
+#[test]
+fn state_save_is_blocked_while_a_display_has_no_rows() {
+    let harness = TestHarness::new().with_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness
+        .mock_state
+        .set_space_list_unreadable(EXT_DISPLAY_ID, true);
+    harness
+        .on_iteration(0, |world, state| {
+            assert!(
+                save_blocked(world),
+                "a display whose Spaces were never read must not be saved"
+            );
+            state.set_space_list_unreadable(EXT_DISPLAY_ID, false);
+        })
+        .on_iteration(3, |world, _state| {
+            assert!(
+                !save_blocked(world),
+                "once every display has its rows the state may be saved"
+            );
+        })
+        .run(idle(4));
+}
+
+#[test]
+fn state_save_is_blocked_during_startup_and_restore() {
+    TestHarness::new()
+        .with_windows(1)
+        .with_state(state_with_strips(vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved_window(0))],
+        }]))
+        .on_iteration(0, |world, _state| {
+            assert!(world.contains_resource::<crate::ecs::restore::SessionRestore>());
+            assert!(
+                save_blocked(world),
+                "a half-restored world must not be saved"
+            );
+        })
+        .on_iteration(5, |world, _state| {
+            assert!(!world.contains_resource::<crate::ecs::restore::SessionRestore>());
+            assert!(!save_blocked(world), "a healthy world may be saved");
+            world.insert_resource(crate::ecs::Initializing);
+            assert!(
+                save_blocked(world),
+                "a world still starting up must not be saved"
+            );
+            world.remove_resource::<crate::ecs::Initializing>();
+        })
+        .run(idle(6));
 }
 
 #[test]

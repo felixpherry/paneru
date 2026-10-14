@@ -94,6 +94,9 @@ struct MockStateInner {
     /// Windows the app keeps out of its accessibility window list while the
     /// window server still reports them on screen: a background native tab.
     background_tabs: HashSet<WinID>,
+    /// Displays whose Space list can't be read: `present_displays` reports
+    /// them with no Spaces, as the real scan does after Phase 3.
+    unreadable_space_lists: HashSet<u32>,
 }
 
 #[derive(Clone)]
@@ -116,6 +119,7 @@ impl MockState {
                 unordered_windows: HashSet::new(),
                 closed: Vec::new(),
                 background_tabs: HashSet::new(),
+                unreadable_space_lists: HashSet::new(),
             })),
         }
     }
@@ -262,6 +266,15 @@ impl MockState {
     pub fn set_display_bounds(&self, id: u32, bounds: IRect) {
         let mut inner = self.inner.force_write();
         inner.displays.get_mut(&id).expect("finding display").bounds = bounds;
+    }
+
+    pub fn set_space_list_unreadable(&self, display_id: u32, unreadable: bool) {
+        let mut inner = self.inner.force_write();
+        if unreadable {
+            inner.unreadable_space_lists.insert(display_id);
+        } else {
+            inner.unreadable_space_lists.remove(&display_id);
+        }
     }
 
     #[allow(unused)]
@@ -825,14 +838,19 @@ impl MockState {
 
         let s = self.clone();
         wm.expect_present_displays().returning(move || {
-            s.inner
-                .force_read()
+            let inner = s.inner.force_read();
+            inner
                 .displays
                 .values()
                 .map(|d| {
+                    let workspaces = if inner.unreadable_space_lists.contains(&d.id) {
+                        Vec::new()
+                    } else {
+                        d.workspaces.clone()
+                    };
                     (
                         Display::new(d.id, d.bounds, TEST_MENUBAR_HEIGHT),
-                        d.workspaces.clone(),
+                        workspaces,
                     )
                 })
                 .collect()

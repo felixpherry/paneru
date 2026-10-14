@@ -7,7 +7,7 @@ use bevy::app::AppExit;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::Has;
+use bevy::ecs::query::{Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Query, Res, SystemParam};
 use bevy::math::IRect;
@@ -18,7 +18,10 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
-use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker, Unmanaged};
+use crate::ecs::restore::SessionRestore;
+use crate::ecs::{
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Initializing, SelectedVirtualMarker, Unmanaged,
+};
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use crate::types::windowset::WindowSet;
@@ -440,7 +443,8 @@ impl QueryStateParams<'_, '_> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the window manager cannot enumerate a workspace.
+    /// Never fails today: a Space whose windows can't be read is skipped with
+    /// a warning, so one bad Space can't stop every query, bind and broadcast.
     pub fn extract(&self) -> crate::errors::Result<PaneruQueryState> {
         PaneruQueryState::extract(
             &self.workspaces,
@@ -458,6 +462,10 @@ impl QueryStateParams<'_, '_> {
 /// windows, this keeps the strip's column structure — needed for `ws:swap`,
 /// `ws:east`, `ws:stack` and friends to know what is beside what.
 impl QueryStateParams<'_, '_> {
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "same contract as QueryState::extract; callers treat both alike"
+    )]
     pub fn extract_window_set(&self) -> crate::errors::Result<WindowSet> {
         use crate::types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
 
@@ -477,7 +485,10 @@ impl QueryStateParams<'_, '_> {
             let floating_entities = if active_workspace
                 || selected_workspace && active_workspace_id != Some(strip.id())
             {
-                self.window_manager.windows_in_workspace(strip.id())?
+                self.window_manager
+                    .windows_in_workspace(strip.id())
+                    .inspect_err(|err| warn!("Skipping unreadable space {}: {err}", strip.id()))
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -679,7 +690,10 @@ impl QueryState for PaneruQueryState {
             let floating = if active_workspace
                 || selected_workspace && active_workspace_id != Some(strip.id())
             {
-                window_manager.windows_in_workspace(strip.id())?
+                window_manager
+                    .windows_in_workspace(strip.id())
+                    .inspect_err(|err| warn!("Skipping unreadable space {}: {err}", strip.id()))
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -800,6 +814,38 @@ fn now_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Whether the world may be written to the state file. An empty or
+/// half-built world must never replace the saved layout.
+#[derive(SystemParam)]
+pub(crate) struct SaveGuard<'w, 's> {
+    displays: Query<'w, 's, Entity, With<Display>>,
+    rows: Query<'w, 's, &'static ChildOf, With<LayoutStrip>>,
+    initializing: Option<Res<'w, Initializing>>,
+    restore: Option<Res<'w, SessionRestore>>,
+}
+
+impl SaveGuard<'_, '_> {
+    /// Why the state must not be saved now, or `None` when it may be.
+    pub(crate) fn blocked_by(&self) -> Option<&'static str> {
+        if self.initializing.is_some() {
+            Some("startup is still running")
+        } else if self.restore.is_some() {
+            Some("session restore is still running")
+        } else if self.displays.is_empty() {
+            Some("no display is known")
+        } else if self
+            .displays
+            .iter()
+            .any(|display| !self.rows.iter().any(|row| row.parent() == display))
+        {
+            // A display kept with an unreadable Space list has no rows yet.
+            Some("a display has no rows yet")
+        } else {
+            None
+        }
+    }
+}
+
 pub fn periodic_state_save(
     workspaces: Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
@@ -821,8 +867,13 @@ pub fn cleanup_on_exit(
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
+    guard: SaveGuard,
 ) {
     if exit_events.read().next().is_some() {
+        if let Some(reason) = guard.blocked_by() {
+            info!("Exiting without saving state: {reason}");
+            return;
+        }
         info!("Exiting, saving state...");
         let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
         let path = PaneruState::default_state_file_path();

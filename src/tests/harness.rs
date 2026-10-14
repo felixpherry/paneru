@@ -271,6 +271,15 @@ pub(crate) fn find_window_entity(window_id: WinID, world: &mut World) -> Entity 
         .map_or_else(|| panic!("window {window_id} not found"), |(_, e)| e)
 }
 
+/// `steps` no-op commands, for tests that only need time to pass.
+pub(crate) fn idle(steps: usize) -> Vec<Event> {
+    (0..steps)
+        .map(|_| Event::Command {
+            command: crate::commands::Command::PrintState,
+        })
+        .collect()
+}
+
 #[macro_export]
 macro_rules! assert_window_at {
     ($world:expr, $id:expr, $x:expr, $y:expr) => {{
