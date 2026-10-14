@@ -1071,11 +1071,11 @@ fn manage_window(
 
     // Going floating -> managed only flips the component. Nothing else in
     // the pipeline reinserts the window into a strip, so if it had been
-    // stripped of membership (spawn-floating path in window_unmanaged_trigger
-    // strip.removes; orphan rescue in find_orphaned_workspaces despawns the
-    // strip) the toggle is invisible — the window stays where it floated
-    // and the user thinks the keybind is broken. Append to the active
-    // strip and reshuffle so the layout pipeline tiles it.
+    // stripped of membership (the spawn-floating path in
+    // window_unmanaged_trigger strip.removes) the toggle is invisible — the
+    // window stays where it floated and the user thinks the keybind is
+    // broken. Append to the active strip and reshuffle so the layout
+    // pipeline tiles it.
     if was_unmanaged
         && !workspaces.iter().any(|(strip, _)| strip.contains(entity))
         && let Some(mut strip) = workspaces

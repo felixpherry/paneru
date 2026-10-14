@@ -761,9 +761,12 @@ fn prune_dead_space_rows(
     *suspects = dead;
 }
 
+/// Re-parents a row orphaned by an unplugged display once a display lists its
+/// Space. A row still orphaned when its `Timeout` ends is despawned by
+/// `timeout_ticker`; its windows are then strays that `adopt_stray_windows` tiles.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn find_orphaned_workspaces(
-    orphans: Populated<(&LayoutStrip, Entity, &Timeout, Option<&ChildOf>), With<Timeout>>,
+    orphans: Populated<(&LayoutStrip, Entity, Option<&ChildOf>), With<Timeout>>,
     displays: Populated<(&Display, Entity)>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
@@ -771,7 +774,7 @@ fn find_orphaned_workspaces(
     let present = window_manager.present_displays();
     let mut rehomed = false;
 
-    for (orphan, orphan_entity, timeout, child) in orphans {
+    for (orphan, orphan_entity, child) in orphans {
         // Row 0 is the row every space is created with, so it is re-parented
         // like a populated strip: despawning it leaves the space numbered from
         // "2" with no row that any switch or reap path recreates.
@@ -791,17 +794,6 @@ fn find_orphaned_workspaces(
                 "layout strip {} was re-parented, removing timeout.",
                 orphan.id()
             );
-            continue;
-        }
-
-        if timeout.timer.is_finished() {
-            // Rescue windows from orphaned strips before despawning by floating them.
-            debug!("Rescue windows from timed out orphan {}.", orphan.id());
-            for lost_window in orphan.all_windows() {
-                if let Ok(mut cmd) = commands.get_entity(lost_window) {
-                    cmd.try_insert(Unmanaged::Floating);
-                }
-            }
             continue;
         }
 

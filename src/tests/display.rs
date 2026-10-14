@@ -2453,6 +2453,89 @@ fn adopt_waits_for_a_launched_window_to_settle() {
         .run(commands);
 }
 
+/// Unplugs the external display holding window 100. macOS lists the window on
+/// the laptop's Space only after reconcile has settled, so it waits in the
+/// orphaned row until that row's 30 s timeout.
+fn unplug_with_a_window_listed_late() -> TestHarness {
+    let mut harness = TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID])
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {});
+    harness.advance(Duration::from_millis(500));
+    harness.mock_state.remove_display(EXT_DISPLAY_ID);
+    harness
+        .world()
+        .write_message::<Event>(Event::DisplayRemoved {
+            display_id: EXT_DISPLAY_ID,
+        });
+    harness.advance(Duration::from_secs(3));
+
+    let world = harness.world();
+    assert_eq!(row_parents(world, EXT_WORKSPACE_ID), [None], "orphaned");
+    let orphan = row_entity(world, EXT_WORKSPACE_ID, 0);
+    assert!(row_windows(world, orphan).contains(&find_window_entity(100, world)));
+    harness
+        .mock_state
+        .update_window(100, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    harness
+}
+
+fn assert_tiled_on_the_laptop(world: &mut World) {
+    let window = find_window_entity(100, world);
+    assert!(
+        world.get::<crate::ecs::Unmanaged>(window).is_none(),
+        "window 100 is managed, not floated"
+    );
+    let home = row_entity(world, TEST_WORKSPACE_ID, 0);
+    assert!(
+        row_windows(world, home).contains(&window),
+        "window 100 is tiled"
+    );
+    assert!(row_parents(world, EXT_WORKSPACE_ID).is_empty());
+}
+
+/// A window left in an unplugged display's row ends tiled once the row times
+/// out: the row goes, and the adopt step picks the window up.
+#[test]
+fn unplugged_window_is_tiled_once_its_orphaned_row_times_out() {
+    let mut harness = unplug_with_a_window_listed_late();
+    harness.advance(Duration::from_secs(25));
+    let world = harness.world();
+    let orphan = row_entity(world, EXT_WORKSPACE_ID, 0);
+    assert!(
+        row_windows(world, orphan).contains(&find_window_entity(100, world)),
+        "nothing moves the window before the timeout"
+    );
+
+    harness.advance(Duration::from_secs(8));
+    assert_tiled_on_the_laptop(harness.world());
+}
+
+/// The orphan check runs once a second. When it runs in the frame the row's
+/// timeout is despawned, the window must still end tiled, not floated.
+#[test]
+fn unplugged_window_is_tiled_when_the_orphan_check_lands_on_the_timeout() {
+    let mut harness = unplug_with_a_window_listed_late();
+    // The 1 s check runs on frames where the clock reads a whole second. Stop
+    // one frame before such a frame and finish the row's timeout: in that
+    // frame the check sees it finished, then the ticker despawns the row.
+    loop {
+        let time = harness.world().resource::<Time>();
+        let frame = time.delta();
+        if (time.elapsed() + frame).subsec_nanos() == 0 {
+            break;
+        }
+        harness.advance(frame);
+    }
+    let world = harness.world();
+    let orphan = row_entity(world, EXT_WORKSPACE_ID, 0);
+    let mut timeout = world.get_mut::<Timeout>(orphan).expect("orphan timeout");
+    let remaining = timeout.timer.remaining();
+    timeout.timer.tick(remaining);
+
+    harness.advance(Duration::from_secs(3));
+    assert_tiled_on_the_laptop(harness.world());
+}
+
 /// A window already fullscreen at startup gets a fullscreen row that knows its
 /// home, and no spare row. Leaving fullscreen brings it back to that home.
 #[test]
