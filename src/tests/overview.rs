@@ -1680,6 +1680,31 @@ fn test_overview_badge_jumps_to_another_row() {
         ]);
 }
 
+/// ↓ makes VW1 the active row. Window 0, alone there, keeps `3`; numbering
+/// afresh would give it `1`.
+#[test]
+fn test_overview_labels_survive_a_row_switch() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(2, |world, _state| {
+            assert_eq!(badge(world, 0).as_deref(), Some("3"));
+        })
+        .on_iteration(3, |world, _state| {
+            assert_open(world);
+            assert_eq!(active_virtual_index(world), 1, "↓ switched row");
+            let overview = world.resource::<Overview>();
+            let active = overview.layout.rows.iter().find(|row| row.is_active);
+            assert_eq!(active.map(|row| row.virtual_index), Some(1), "reprojected");
+            assert_eq!(badge(world, 0).as_deref(), Some("3"), "label kept");
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            send_window_down(),
+            toggle(),
+            key(KEY_DOWN),
+        ]);
+}
+
 // ── Wallpaper capture ─────────────────────────────────────────────────────
 
 #[test]

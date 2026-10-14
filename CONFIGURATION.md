@@ -342,9 +342,10 @@ overview, and it follows them. While it is open:
 **Badges** label every tile at least partly on screen: the focused row first,
 left to right, then the rows above and below, nearest first. With more tiles
 than keys, the last key becomes a prefix for two-key labels (`01`, `02`, …). A
-tile keeps its label until the overview closes. A bare key bound in your config
-runs its binding instead of acting as a badge key. `shortcuts = false` turns
-badges off.
+tile keeps its label until the overview closes, except the tile holding `0`,
+which moves to `01` once two-key labels start. A card too small for its badge
+hides it. A bare key bound in your config runs its binding instead of acting as
+a badge key. `shortcuts = false` turns badges off.
 
 Clicking a tile focuses that window first (switching workspace if needed), then
 the overview zooms in onto it; clicking anywhere else closes. A click on

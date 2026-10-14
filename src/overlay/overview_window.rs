@@ -159,10 +159,13 @@ const TITLE_FONT_SIZE: CGFloat = 12.0;
 const BADGE_FILL: [f64; 3] = [0.10, 0.10, 0.12];
 /// The untyped part of a badge's label; the typed part is white.
 const BADGE_ACCENT: [f64; 3] = [0.55, 0.85, 1.0];
-const BADGE_FONT_SIZE: CGFloat = 19.0;
+/// Umbriel's Pango `monospace 19`: 19 pt at Pango's 96 dpi is 25⅓ px, one
+/// macOS point each.
+const BADGE_FONT_SIZE: CGFloat = 19.0 * 96.0 / 72.0;
 /// A badge's inset from its card's edges.
 const BADGE_MARGIN: CGFloat = 6.0;
-const BADGE_RADIUS: CGFloat = 6.0;
+/// Umbriel's card radius (10) at its overview zoom (0.5).
+const BADGE_RADIUS: CGFloat = 5.0;
 
 /// `label` as its badge draws it: the first `typed` bytes white, the rest in
 /// the accent colour. Keyed for Core Text, which is what a `CATextLayer` draws
