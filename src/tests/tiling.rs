@@ -725,6 +725,89 @@ fn test_space_notification_for_dead_window_removes_it() {
     );
 }
 
+/// A space notification for a window whose app is too busy to answer AX in
+/// time is a Space change, not a close: the window and its slot stay.
+#[test]
+fn test_space_notification_for_busy_window_keeps_it() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.advance(Duration::from_millis(100));
+
+    harness.mock_state.set_window_busy(1, true);
+    harness
+        .app
+        .world_mut()
+        .write_message::<Event>(Event::WindowDestroyed {
+            window_id: 1,
+            source: DestroySource::SpaceNotification,
+        });
+    harness.advance(Duration::from_millis(60));
+
+    let world = harness.app.world_mut();
+    assert!(
+        window_exists(world, 1),
+        "a busy app's window must survive a space notification"
+    );
+    let window = find_window_entity(1, world);
+    assert!(
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .any(|strip| strip.contains(window)),
+        "its row still holds it"
+    );
+}
+
+/// Four windows stacked on a 748 px column can't each get the 200 px floor.
+/// They share the column evenly instead of the column dropping out of the layout.
+#[test]
+fn overfull_stack_shares_the_column_evenly() {
+    const VIEWPORT_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
+    // Once startup has focused window 0: focus the next column and stack it,
+    // three times.
+    let east = || Event::Command {
+        command: Command::Window(Operation::Focus(Direction::East)),
+    };
+    let stack = || Event::Command {
+        command: Command::Window(Operation::Stack(true)),
+    };
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        east(),
+        stack(),
+        east(),
+        stack(),
+        east(),
+        stack(),
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(5)
+        .on_iteration(7, |world, _state| {
+            for id in 0..4 {
+                assert_window_size!(world, id, TEST_WINDOW_WIDTH, VIEWPORT_HEIGHT / 4);
+            }
+            let mut frame = |id| {
+                world
+                    .query::<&Window>()
+                    .iter(world)
+                    .find(|window| window.id() == id)
+                    .expect("window")
+                    .frame()
+            };
+            let (three, four) = (frame(3), frame(4));
+            assert!(
+                three.intersect(four).is_empty(),
+                "window 4 {four:?} overlaps window 3 {three:?}"
+            );
+        })
+        .run(commands);
+}
+
 /// Closing a floating window despawns it, which removes its `Unmanaged` marker.
 /// That removal must not put the dying window back into the layout strip.
 #[test]

@@ -176,6 +176,101 @@ fn test_startup_restore_keeps_fullscreen_separate_from_unmatched_windows() {
     );
 }
 
+/// A restored fullscreen row knows the restored row its window returns to, so
+/// leaving fullscreen after a restart brings the window home.
+#[test]
+fn restored_fullscreen_row_returns_home_when_it_leaves_fullscreen() {
+    const FS: WorkspaceId = TEST_WORKSPACE_ID + 100;
+    let bounds = IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT);
+    let saved_workspace = |workspace_id, column| SavedWorkspace {
+        workspace_id,
+        display_id: Some(TEST_DISPLAY_ID),
+        active_virtual_index: Some(0),
+        strips: vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![column],
+        }],
+    };
+    let state = PaneruState {
+        version: 2,
+        timestamp: 123_456_789,
+        active_display_id: Some(TEST_DISPLAY_ID),
+        displays: vec![SavedDisplay {
+            workspace_ids: vec![TEST_WORKSPACE_ID, FS],
+            ..saved_display(TEST_DISPLAY_ID, true)
+        }],
+        workspaces: vec![
+            saved_workspace(TEST_WORKSPACE_ID, SavedColumn::Single(saved_window(0))),
+            saved_workspace(FS, SavedColumn::Fullscreen(saved_window(1))),
+        ],
+    };
+    let row_holding = |world: &mut World, window: Entity| {
+        world
+            .query::<(Entity, &LayoutStrip)>()
+            .iter(world)
+            .find(|(_, strip)| !strip.is_fullscreen() && strip.contains(window))
+            .map(|(entity, _)| entity)
+            .expect("a row holds the window")
+    };
+
+    let harness =
+        TestHarness::new().with_display(TEST_DISPLAY_ID, bounds, vec![TEST_WORKSPACE_ID, FS]);
+    harness.mock_state.set_space_fullscreen(FS, true);
+    harness
+        .with_windows(1)
+        .with_workspace_window(1, FS, |window| window.is_full_screen = true)
+        .with_state(state)
+        .on_iteration(0, move |world, mut state| {
+            let tiled = find_window_entity(0, world);
+            let home = row_holding(world, tiled);
+            let fullscreen = find_window_entity(1, world);
+            let homes = world
+                .query::<(&LayoutStrip, Option<&crate::ecs::NativeFullscreenMarker>)>()
+                .iter(world)
+                .filter(|(strip, _)| {
+                    strip.id() == FS && strip.is_fullscreen() && strip.contains(fullscreen)
+                })
+                .map(|(_, marker)| marker.map(|marker| marker.layout_strip))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                homes,
+                [Some(home)],
+                "the restored fullscreen row knows its home"
+            );
+
+            // The window leaves fullscreen: macOS moves it home and drops the Space.
+            state.update_window(1, |window| {
+                window.workspace_id = TEST_WORKSPACE_ID;
+                window.is_full_screen = false;
+            });
+            state.add_display(TEST_DISPLAY_ID, bounds, vec![TEST_WORKSPACE_ID]);
+        })
+        .on_iteration(1, move |world, _state| {
+            let tiled = find_window_entity(0, world);
+            let home = row_holding(world, tiled);
+            let window = find_window_entity(1, world);
+            assert!(
+                world
+                    .get::<LayoutStrip>(home)
+                    .is_some_and(|strip| strip.contains(window)),
+                "the window is back in its home row"
+            );
+            assert!(
+                world
+                    .query::<&LayoutStrip>()
+                    .iter(world)
+                    .all(|strip| strip.id() != FS),
+                "no fullscreen row is left"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceDestroyed { space_id: FS },
+        ]);
+}
+
 #[test]
 fn test_startup_restore_prefers_existing_workspace_parent_before_saved_or_active_display() {
     let mut harness = TestHarness::new();

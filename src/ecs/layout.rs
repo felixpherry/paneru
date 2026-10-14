@@ -772,8 +772,13 @@ impl LayoutStrip {
     /// `Ok(())` if the stacking is successful or not needed, otherwise `Err(Error)` if the window is not found.
     pub fn stack(&mut self, entity: Entity) -> Result<()> {
         let index = self.index_of(entity)?;
-        if index == 0 {
-            // Can not stack to the left if left most window already.
+        // Can't stack the leftmost column, and a fullscreen column holds its one
+        // window: check both before taking either out.
+        if index == 0
+            || [index, index - 1]
+                .iter()
+                .any(|&i| matches!(self.columns.get(i), Some(Column::Fullscren(_))))
+        {
             return Ok(());
         }
 
@@ -1025,10 +1030,10 @@ impl LayoutStrip {
         self.index_of(entity)
             .and_then(|idx| self.get(idx))
             .map(|col| match col {
-                Column::Tabs(tabs) => tabs.contains(&entity),
+                Column::Tabs(tabs) => tabs.len() > 1 && tabs.contains(&entity),
                 Column::Stack(items) => items.iter().any(|item| {
                     if let StackItem::Tabs(tabs) = item {
-                        tabs.contains(&entity)
+                        tabs.len() > 1 && tabs.contains(&entity)
                     } else {
                         false
                     }
@@ -1175,16 +1180,21 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
         // Integer division (floor) on purpose: rounding here could make the
         // heights sum past `total_height`.
         let avg_height = (total_height - sum) / (remaining + 1);
-        if avg_height < min_height {
-            return None;
-        }
-
-        while count < heights.len() {
-            output.push(avg_height);
-            count += 1;
+        if avg_height >= min_height {
+            while count < heights.len() {
+                output.push(avg_height);
+                count += 1;
+            }
         }
     }
 
+    if output.len() < heights.len() {
+        // Too many windows for the floor: share the column evenly; the last
+        // window takes the rounding remainder.
+        let n = i32::try_from(heights.len()).ok()?;
+        output = vec![total_height / n; heights.len()];
+        *output.last_mut()? += total_height % n;
+    }
     Some(output)
 }
 
@@ -2153,7 +2163,41 @@ mod tests {
         assert_eq!(out, vec![110, 110, 110, 110]);
 
         let out = binpack_heights(&heights, MIN_HEIGHT, 390);
-        assert_eq!(out, None);
+        assert_eq!(out, Some(vec![97, 97, 97, 99]));
+
+        // A full-height first window can't fit any split; still share evenly.
+        let out = binpack_heights(&[748, 249, 249, 250], 200, 748);
+        assert_eq!(out, Some(vec![187, 187, 187, 187]));
+    }
+
+    #[test]
+    fn binpack_splits_evenly_when_the_floor_cannot_hold() {
+        let out = binpack_heights(&[249, 249, 250, 748], 200, 748).expect("an even split");
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.iter().sum::<i32>(), 748);
+        let spread = out.iter().max().unwrap() - out.iter().min().unwrap();
+        assert!(spread <= 1, "uneven split {out:?}");
+    }
+
+    #[test]
+    fn stack_next_to_a_fullscreen_column_keeps_both() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+        let (a, b, f) = (entities[0], entities[1], entities[2]);
+
+        // Onto a fullscreen column.
+        let mut strip = LayoutStrip::fullscreen(1, a);
+        strip.append(b);
+        assert!(strip.stack(b).is_ok());
+        assert_eq!(strip.all_windows(), [a, b]);
+        assert!(strip.is_fullscreen());
+
+        // A fullscreen column onto its left neighbour.
+        let mut strip = LayoutStrip::new(1, 0);
+        strip.columns.push_back(Column::Single(a));
+        strip.columns.push_back(Column::Fullscren(f));
+        assert!(strip.stack(f).is_ok());
+        assert_eq!(strip.all_windows(), [a, f]);
     }
 
     #[test]

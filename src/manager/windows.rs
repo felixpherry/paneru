@@ -1,9 +1,9 @@
 use accessibility_sys::{
-    AXUIElementCreateApplication, AXUIElementRef, AXValueCreate, AXValueGetValue,
-    kAXCloseButtonAttribute, kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXErrorSuccess,
-    kAXFloatingWindowSubrole, kAXPositionAttribute, kAXPressAction, kAXRaiseAction,
-    kAXSizeAttribute, kAXStandardWindowSubrole, kAXUnknownRole, kAXUnknownSubrole,
-    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
+    AXError, AXUIElementCreateApplication, AXUIElementRef, AXValueCreate, AXValueGetValue,
+    kAXCloseButtonAttribute, kAXErrorAttributeUnsupported, kAXErrorInvalidUIElement,
+    kAXErrorNoValue, kAXErrorSuccess, kAXFloatingWindowSubrole, kAXPositionAttribute,
+    kAXPressAction, kAXRaiseAction, kAXRoleAttribute, kAXSizeAttribute, kAXStandardWindowSubrole,
+    kAXUnknownRole, kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
@@ -163,6 +163,14 @@ fn acquire_enhanced_ui<F: FnOnce() -> Result<()>>(
         restore: Some(restore),
         pid,
     }))
+}
+
+/// Whether an AX element still exists, given the error (if any) of a fresh
+/// attribute read. A busy app answers kAXErrorCannotComplete once the 0.25 s
+/// messaging timeout passes, and its window is still there; only
+/// kAXErrorInvalidUIElement says the element is gone.
+pub(crate) fn element_alive(read_error: Option<AXError>) -> bool {
+    read_error != Some(kAXErrorInvalidUIElement)
 }
 
 fn decode_enhanced_ui_read(ax_error: OSStatus, value: Option<bool>) -> Result<bool> {
@@ -771,10 +779,11 @@ impl WindowApi for WindowOS {
     /// cache. `Self::role` keeps returning its stored value after the window
     /// is gone, so it always looks alive; only a fresh read fails once the
     /// AX element is torn down. Don't "simplify" this to `self.role().is_ok()`.
-    /// Every window has a role, so a failed read means the element is gone
-    /// rather than that an attribute is missing.
+    /// A busy app's read times out with kAXErrorCannotComplete while its window
+    /// is still there, so only kAXErrorInvalidUIElement counts as gone.
     fn is_alive(&self) -> bool {
-        self.ax_element.role().is_ok()
+        let role = CFString::from_static_str(kAXRoleAttribute);
+        element_alive(self.ax_element.attribute_error(&role))
     }
 
     #[instrument(level = Level::DEBUG, ret)]
@@ -1038,6 +1047,18 @@ mod tests {
     use crate::platform::ProcessSerialNumber;
     use crate::tests::TestHarness;
     use std::sync::{atomic::AtomicUsize, mpsc};
+
+    #[test]
+    fn only_an_invalid_element_is_dead() {
+        use accessibility_sys::{kAXErrorCannotComplete, kAXErrorInvalidUIElement};
+
+        assert!(element_alive(None));
+        assert!(
+            element_alive(Some(kAXErrorCannotComplete)),
+            "a busy app's window is still there"
+        );
+        assert!(!element_alive(Some(kAXErrorInvalidUIElement)));
+    }
 
     #[test]
     fn enhanced_ui_termination_discards_failed_restoration_before_pid_reuse() {

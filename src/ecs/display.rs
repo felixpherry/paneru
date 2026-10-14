@@ -30,7 +30,7 @@ use crate::ecs::{
     VerifyWindowSize,
 };
 use crate::events::Event;
-use crate::manager::{Display, Window, WindowManager, irect_from};
+use crate::manager::{Display, Origin, Window, WindowManager, irect_from};
 use crate::platform::{PlatformCallbacks, WinID, WorkspaceId};
 use crate::util::{read_screen_property, round_px};
 use bevy::ecs::entity::EntityHashSet;
@@ -140,6 +140,7 @@ fn display_change_handler(
 /// macOS may report an empty or incomplete display list during reconfiguration;
 /// applying that transient list would orphan every workspace. A successful
 /// scan refreshes both display ownership and the positions of its strips.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn reconcile_displays(
     mut messages: MessageReader<Event>,
     workspaces: Query<(&LayoutStrip, Entity, Option<&ChildOf>)>,
@@ -234,7 +235,13 @@ pub(crate) fn reconcile_displays(
             error!("Unable to find added display: {display_id}");
             continue;
         };
-        add_display(display, &workspace_ids, &workspaces, &mut commands);
+        add_display(
+            display,
+            &workspace_ids,
+            &workspaces,
+            &window_manager,
+            &mut commands,
+        );
     }
 
     // Displays that are still present: refresh their bounds (resolution or
@@ -251,6 +258,7 @@ pub(crate) fn reconcile_displays(
             &workspace_ids,
             &mut displays,
             &workspaces,
+            &window_manager,
             &mut commands,
         );
     }
@@ -688,6 +696,7 @@ fn add_display(
     display: Display,
     workspace_ids: &[WorkspaceId],
     existing_strips: &Query<(&LayoutStrip, Entity, Option<&ChildOf>)>,
+    window_manager: &WindowManager,
     commands: &mut Commands,
 ) {
     let display_id = display.id();
@@ -702,6 +711,7 @@ fn add_display(
         display_entity,
         &display_bounds,
         existing_strips,
+        window_manager,
         commands,
     );
 }
@@ -759,6 +769,7 @@ fn move_display(
     workspace_ids: &[WorkspaceId],
     displays: &mut Query<(&mut Display, Entity)>,
     existing_strips: &Query<(&LayoutStrip, Entity, Option<&ChildOf>)>,
+    window_manager: &WindowManager,
     commands: &mut Commands,
 ) {
     let display_id = moved_display.id();
@@ -778,6 +789,7 @@ fn move_display(
         display_entity,
         &display.bounds(),
         existing_strips,
+        window_manager,
         commands,
     );
 }
@@ -787,14 +799,25 @@ fn reparent_existing_workspaces(
     display_entity: Entity,
     display_bounds: &IRect,
     existing_strips: &Query<(&LayoutStrip, Entity, Option<&ChildOf>)>,
+    window_manager: &WindowManager,
     commands: &mut Commands,
 ) {
+    // Desktops first, so a new fullscreen Space's row can name one as its home.
+    let mut spaces: Vec<_> = workspace_ids
+        .iter()
+        .map(|&id| (window_manager.space_is_fullscreen(id), id))
+        .collect();
+    spaces.sort_by_key(|&(fullscreen, _)| fullscreen);
+    let mut home = None;
+
     // Verifies that a moved display has all the workspaces which it owns.
-    for &id in workspace_ids {
-        let mut found = false;
+    for (fullscreen, id) in spaces {
+        let mut row = None;
         for (strip, entity, child) in existing_strips {
             if strip.id() == id {
-                found = true;
+                if row.is_none() || strip.virtual_index == 0 {
+                    row = Some(entity);
+                }
                 if child.is_none_or(|child| child.parent() != display_entity) {
                     // Re-parent this workspace
                     if let Ok(mut cmd) = commands.get_entity(entity) {
@@ -807,13 +830,51 @@ fn reparent_existing_workspaces(
             }
         }
 
-        if !found {
-            // New workspace.
-            let origin = display_bounds.min;
+        let row = row.unwrap_or_else(|| {
             debug!("new workspace {id} on display {display_entity}");
-            commands.spawn_layout_strip(LayoutStrip::new(id, 0), origin, display_entity, false);
+            let home = home.filter(|_| fullscreen);
+            spawn_space_rows(
+                commands,
+                id,
+                display_entity,
+                display_bounds.min,
+                false,
+                home,
+            )
+        });
+        if !fullscreen {
+            home.get_or_insert((row, id));
         }
     }
+}
+
+/// Spawns what a Space starts with — row 0 and its floating layer — and
+/// returns row 0. A fullscreen Space's row gets `home`: the row (and its
+/// Space) its window returns to when it leaves fullscreen.
+pub(crate) fn spawn_space_rows(
+    commands: &mut Commands,
+    space_id: WorkspaceId,
+    display_entity: Entity,
+    origin: Origin,
+    active: bool,
+    home: Option<(Entity, WorkspaceId)>,
+) -> Entity {
+    commands.spawn((FloatingLayer::new(space_id), ChildOf(display_entity)));
+    let mut row = commands.spawn_layout_strip(
+        LayoutStrip::new(space_id, 0),
+        origin,
+        display_entity,
+        active,
+    );
+    if let Some((layout_strip, workspace_id)) = home {
+        // usize::MAX: the end of the home row (insert_at clamps).
+        row.insert(NativeFullscreenMarker {
+            layout_strip,
+            workspace_id,
+            index: usize::MAX,
+        });
+    }
+    row.id()
 }
 
 /// Tracks whether floating windows on a workspace sit above or behind tiled

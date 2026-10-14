@@ -1,6 +1,7 @@
 use accessibility_sys::{
-    AXObserverGetRunLoopSource, AXUIElementRef, kAXFocusedWindowAttribute, kAXMinimizedAttribute,
-    kAXRoleAttribute, kAXSubroleAttribute, kAXTitleAttribute, kAXWindowsAttribute,
+    AXError, AXObserverGetRunLoopSource, AXUIElementRef, kAXErrorSuccess,
+    kAXFocusedWindowAttribute, kAXMinimizedAttribute, kAXRoleAttribute, kAXSubroleAttribute,
+    kAXTitleAttribute, kAXWindowsAttribute,
 };
 use core::ptr::NonNull;
 use objc2::rc::{Retained, autoreleasepool};
@@ -213,6 +214,10 @@ pub trait AXUIAttributes {
     }
 
     fn get_attribute<T: Type>(&self, name: &CFRetained<CFString>) -> Result<CFRetained<T>>;
+
+    /// The raw AX error of reading `name`, or `None` when the read succeeds.
+    /// For callers that must tell error codes apart; everything else uses `get_attribute`.
+    fn attribute_error(&self, name: &CFRetained<CFString>) -> Option<AXError>;
 }
 
 impl AXUIAttributes for CFRetained<AXUIWrapper> {
@@ -225,6 +230,14 @@ impl AXUIAttributes for CFRetained<AXUIWrapper> {
             .ok_or(Error::InvalidInput(format!(
                 "nullptr while getting attribute {name}.",
             )))
+    }
+
+    fn attribute_error(&self, name: &CFRetained<CFString>) -> Option<AXError> {
+        let mut attribute: *mut CFType = null_mut();
+        let error = unsafe { AXUIElementCopyAttributeValue(self.as_ptr(), name, &mut attribute) };
+        // Only the code matters; release whatever value came back.
+        drop(NonNull::new(attribute).map(|ptr| unsafe { CFRetained::<CFType>::from_raw(ptr) }));
+        (error != kAXErrorSuccess).then_some(error)
     }
 }
 

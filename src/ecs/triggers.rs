@@ -26,9 +26,9 @@ use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
-    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    VerifyWindowPosition, WidthRatio, WindowProperties,
+    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition,
+    NativeFullscreenMarker, Position, ResizeMarker, RestoreWindowState, Scrolling,
+    SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -54,6 +54,20 @@ type AddedWindowDefaults<'w, 's> = Populated<
         &'static ChildOf,
     ),
     Added<Window>,
+>;
+
+/// Rows a new window can be placed in: whether each is active, the home of a
+/// fullscreen row, and its display.
+type PlacementRows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        Option<&'static NativeFullscreenMarker>,
+        Option<&'static ChildOf>,
+    ),
 >;
 
 type WindowDefaultsQueries<'w, 's> = ParamSet<
@@ -1352,7 +1366,7 @@ pub(super) fn apply_window_defaults(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
-    mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut workspaces: PlacementRows,
     apps: Query<(&Application, Option<&OpenedFrom>)>,
     launched: Option<Res<LaunchedFrom>>,
     time: Res<Time>,
@@ -1367,7 +1381,7 @@ pub(super) fn apply_window_positions(
         .map(|launched| launched.strip);
 
     for entity in added {
-        if workspaces.iter().any(|(_, strip, _)| strip.tabbed(entity)) {
+        if workspaces.iter().any(|(_, strip, ..)| strip.tabbed(entity)) {
             debug!("Ignoring tabbed {entity} attributes.");
             continue;
         }
@@ -1398,7 +1412,7 @@ pub(super) fn apply_window_positions(
         if properties.floating() {
             if let Some(mut strip) = workspaces
                 .iter_mut()
-                .find_map(|(_, strip, _)| strip.contains(entity).then_some(strip))
+                .find_map(|(_, strip, ..)| strip.contains(entity).then_some(strip))
             {
                 strip.remove(entity);
             }
@@ -1422,19 +1436,21 @@ pub(super) fn apply_window_positions(
             .filter(|&strip| workspaces.contains(strip));
 
         // During startup, the window is already inserted into some strip by finish_setup.
-        let allready_inserted = workspaces
-            .iter_mut()
-            .find_map(|(_, strip, _)| strip.contains(entity).then_some(strip));
+        let already_inserted = workspaces
+            .iter()
+            .any(|(_, strip, ..)| strip.contains(entity));
+        let chosen = workspaces
+            .iter()
+            .find_map(|(strip_entity, _, active, ..)| {
+                target
+                    .map_or(active, |target| target == strip_entity)
+                    .then_some(strip_entity)
+            })
+            .and_then(|row| row_for_new_window(row, &workspaces));
         if initializing.is_none()
-            && allready_inserted.is_none()
-            && let Some(mut strip) =
-                workspaces
-                    .iter_mut()
-                    .find_map(|(strip_entity, strip, active)| {
-                        target
-                            .map_or(active, |target| target == strip_entity)
-                            .then_some(strip)
-                    })
+            && !already_inserted
+            && let Some(row) = chosen
+            && let Ok((_, mut strip, ..)) = workspaces.get_mut(row)
         {
             // Attempt inserting the window at a pre-defined position, otherwise
             // to the right of the currently focused window. niri remembers that
@@ -1496,6 +1512,32 @@ pub(super) fn apply_window_positions(
             }
         }
     }
+}
+
+/// The row a new window joins in place of `row`. A fullscreen row holds its
+/// one window, so its window goes to its home row instead, else to the lowest
+/// non-fullscreen row on the same display. `None` when there is no such row.
+fn row_for_new_window(row: Entity, rows: &PlacementRows) -> Option<Entity> {
+    let (_, strip, _, marker, child) = rows.get(row).ok()?;
+    if !strip.is_fullscreen() {
+        return Some(row);
+    }
+    let usable = |row: Entity| {
+        rows.get(row)
+            .is_ok_and(|(_, strip, ..)| !strip.is_fullscreen())
+    };
+    marker
+        .map(|marker| marker.layout_strip)
+        .filter(|&home| usable(home))
+        .or_else(|| {
+            let display = child?.parent();
+            rows.iter()
+                .filter(|(_, strip, _, _, child)| {
+                    !strip.is_fullscreen() && child.is_some_and(|child| child.parent() == display)
+                })
+                .min_by_key(|(_, strip, ..)| strip.virtual_index)
+                .map(|(row, ..)| row)
+        })
 }
 
 pub(super) fn refresh_configuration_trigger(

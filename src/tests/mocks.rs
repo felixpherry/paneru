@@ -97,6 +97,8 @@ struct MockStateInner {
     /// Displays whose Space list can't be read: `present_displays` reports
     /// them with no Spaces, as the real scan does after Phase 3.
     unreadable_space_lists: HashSet<u32>,
+    /// Windows whose app is too busy to answer AX in time.
+    busy_windows: HashSet<WinID>,
 }
 
 #[derive(Clone)]
@@ -120,6 +122,7 @@ impl MockState {
                 closed: Vec::new(),
                 background_tabs: HashSet::new(),
                 unreadable_space_lists: HashSet::new(),
+                busy_windows: HashSet::new(),
             })),
         }
     }
@@ -274,6 +277,26 @@ impl MockState {
             inner.unreadable_space_lists.insert(display_id);
         } else {
             inner.unreadable_space_lists.remove(&display_id);
+        }
+    }
+
+    /// Marks `space_id` as a native fullscreen Space (Space type 4).
+    pub fn set_space_fullscreen(&self, space_id: WorkspaceId, fullscreen: bool) {
+        let mut inner = self.inner.force_write();
+        if fullscreen {
+            inner.fullscreen_spaces.insert(space_id);
+        } else {
+            inner.fullscreen_spaces.remove(&space_id);
+        }
+    }
+
+    /// The app owning `window_id` stalls past the AX messaging timeout.
+    pub fn set_window_busy(&self, window_id: WinID, busy: bool) {
+        let mut inner = self.inner.force_write();
+        if busy {
+            inner.busy_windows.insert(window_id);
+        } else {
+            inner.busy_windows.remove(&window_id);
         }
     }
 
@@ -598,8 +621,18 @@ impl MockState {
         });
 
         let s = self.clone();
-        mw.expect_is_alive()
-            .returning(move || s.inner.force_read().windows.contains_key(&id));
+        mw.expect_is_alive().returning(move || {
+            let inner = s.inner.force_read();
+            // A window that is gone answers kAXErrorInvalidUIElement; a busy app's times out.
+            let read_error = if !inner.windows.contains_key(&id) {
+                Some(accessibility_sys::kAXErrorInvalidUIElement)
+            } else if inner.busy_windows.contains(&id) {
+                Some(accessibility_sys::kAXErrorCannotComplete)
+            } else {
+                None
+            };
+            crate::manager::element_alive(read_error)
+        });
 
         let s = self.clone();
         // An empty subrole models a window without an `AXSubrole` attribute,
@@ -806,6 +839,10 @@ impl MockState {
         let mut wm = MockWindowManagerApi::new();
 
         let s = self.clone();
+        wm.expect_new_application()
+            .returning(move |process| Ok(s.create_application(process.pid())));
+
+        let s = self.clone();
         wm.expect_window_is_unordered().returning(move |window_id| {
             let inner = s.inner.force_read();
             inner.unordered_windows.contains(&window_id) || !inner.windows.contains_key(&window_id)
@@ -835,6 +872,10 @@ impl MockState {
                     .and_then(|display| display.workspaces.first())
                     .is_some_and(|workspace_id| inner.fullscreen_spaces.contains(workspace_id))
             });
+
+        let s = self.clone();
+        wm.expect_space_is_fullscreen()
+            .returning(move |space_id| s.inner.force_read().fullscreen_spaces.contains(&space_id));
 
         let s = self.clone();
         wm.expect_present_displays().returning(move || {

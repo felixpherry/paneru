@@ -5,9 +5,11 @@ use bevy::time::TimeUpdateStrategy;
 
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
+use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, SpawnWindowTrigger, Timeout,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, NativeFullscreenMarker,
+    SpawnWindowTrigger, Timeout,
 };
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
@@ -2369,6 +2371,279 @@ fn heal_rebuilds_a_world_left_empty_past_reconciles_retries() {
             assert_eq!(active_space(world), Some(TEST_WORKSPACE_ID));
         })
         .run(idle(15));
+}
+
+/// A native fullscreen Space (P4 tests).
+const FULLSCREEN_SPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
+
+/// Removing a desktop despawns its rows with the windows in them. The windows
+/// macOS moves to another Space must tile into that Space's shown row, but
+/// only once they have been stray on two passes in a row.
+#[test]
+fn adopt_tiles_the_windows_of_a_removed_desktop() {
+    let mut commands = idle(5);
+    commands[1] = Event::SpaceDestroyed {
+        space_id: DEAD_WORKSPACE_ID,
+    };
+
+    TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            main_bounds(),
+            vec![TEST_WORKSPACE_ID, DEAD_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(1, DEAD_WORKSPACE_ID, |_| {})
+        .with_workspace_window(2, DEAD_WORKSPACE_ID, |_| {})
+        .on_iteration(0, |world, mut state| {
+            let windows = [1, 2].map(|id| find_window_entity(id, world));
+            let dead_row = row_entity(world, DEAD_WORKSPACE_ID, 0);
+            assert_eq!(row_windows(world, dead_row), windows);
+            // As macOS does: the windows of a removed desktop go to another Space.
+            for id in [1, 2] {
+                state.update_window(id, |window| window.workspace_id = TEST_WORKSPACE_ID);
+            }
+            state.add_display(TEST_DISPLAY_ID, main_bounds(), vec![TEST_WORKSPACE_ID]);
+        })
+        .on_iteration(2, |world, _state| {
+            assert!(
+                !in_a_row(world, 1) && !in_a_row(world, 2),
+                "one pass is not enough to adopt a window"
+            );
+        })
+        .on_iteration(4, |world, _state| {
+            let home = row_entity(world, TEST_WORKSPACE_ID, 0);
+            let tiled = row_windows(world, home);
+            assert_eq!(tiled.len(), 3, "row 0 holds {tiled:?}");
+            for id in [0, 1, 2] {
+                let window = find_window_entity(id, world);
+                assert!(tiled.contains(&window), "window {id} is adopted into row 0");
+            }
+            assert!(row_parents(world, DEAD_WORKSPACE_ID).is_empty());
+        })
+        .run(commands);
+}
+
+/// A window just tiled where a binding was pressed is left alone while its
+/// move settles (the 6bf2ea4 race), even if its row goes away: it is adopted
+/// only once settled.
+#[test]
+fn adopt_waits_for_a_launched_window_to_settle() {
+    let mut commands = idle(11);
+    commands[1] = Event::SpaceDestroyed {
+        space_id: DEAD_WORKSPACE_ID,
+    };
+
+    TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            main_bounds(),
+            vec![TEST_WORKSPACE_ID, DEAD_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(1, DEAD_WORKSPACE_ID, |_| {})
+        .with_workspace_window(2, DEAD_WORKSPACE_ID, |_| {})
+        .on_iteration(0, |world, mut state| {
+            let now = world.resource::<Time>().elapsed();
+            let launched = find_window_entity(1, world);
+            world
+                .entity_mut(launched)
+                .insert(crate::ecs::LaunchedInto(now));
+            for id in [1, 2] {
+                state.update_window(id, |window| window.workspace_id = TEST_WORKSPACE_ID);
+            }
+            state.add_display(TEST_DISPLAY_ID, main_bounds(), vec![TEST_WORKSPACE_ID]);
+        })
+        .on_iteration(4, |world, _state| {
+            assert!(in_a_row(world, 2), "a settled window is adopted");
+            assert!(!in_a_row(world, 1), "a settling window is left alone");
+        })
+        .on_iteration(10, |world, _state| {
+            assert!(in_a_row(world, 1), "adopted once settled");
+        })
+        .run(commands);
+}
+
+/// A window already fullscreen at startup gets a fullscreen row that knows its
+/// home, and no spare row. Leaving fullscreen brings it back to that home.
+#[test]
+fn fullscreen_window_found_at_startup_returns_home_when_it_leaves_fullscreen() {
+    let config: Config = (
+        MainOptions {
+            dynamic_workspaces: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let harness = TestHarness::new().with_config(config).with_display(
+        TEST_DISPLAY_ID,
+        main_bounds(),
+        vec![TEST_WORKSPACE_ID, FULLSCREEN_SPACE_ID],
+    );
+    harness
+        .mock_state
+        .set_space_fullscreen(FULLSCREEN_SPACE_ID, true);
+    harness
+        .with_windows(1)
+        .with_workspace_window(1, FULLSCREEN_SPACE_ID, |window| {
+            window.is_full_screen = true;
+        })
+        .on_iteration(0, |world, mut state| {
+            let window = find_window_entity(1, world);
+            let home = row_entity(world, TEST_WORKSPACE_ID, 0);
+            let rows = fullscreen_rows(world, FULLSCREEN_SPACE_ID);
+            assert_eq!(rows.len(), 1, "a fullscreen Space gets no spare row");
+            let (is_fullscreen, windows, marker) = &rows[0];
+            assert!(is_fullscreen, "the row is a fullscreen strip");
+            assert_eq!(windows, &[window]);
+            assert_eq!(*marker, Some((home, TEST_WORKSPACE_ID)));
+            assert!(!row_windows(world, home).contains(&window));
+
+            // The window leaves fullscreen: macOS moves it home and drops the Space.
+            state.update_window(1, |window| {
+                window.workspace_id = TEST_WORKSPACE_ID;
+                window.is_full_screen = false;
+            });
+            state.add_display(TEST_DISPLAY_ID, main_bounds(), vec![TEST_WORKSPACE_ID]);
+        })
+        .on_iteration(1, |world, _state| {
+            let window = find_window_entity(1, world);
+            let home = row_entity(world, TEST_WORKSPACE_ID, 0);
+            assert_eq!(row_windows(world, home).last(), Some(&window));
+            assert!(row_parents(world, FULLSCREEN_SPACE_ID).is_empty());
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceDestroyed {
+                space_id: FULLSCREEN_SPACE_ID,
+            },
+        ]);
+}
+
+/// A display whose only Space is fullscreen still has a row parented to it,
+/// so the heal stays quiet and saves are not blocked.
+#[test]
+fn display_whose_only_space_is_fullscreen_keeps_a_row() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    let check = |world: &mut World, _state: MockState| {
+        let ext = display_entity(world, EXT_DISPLAY_ID);
+        assert_eq!(row_parents(world, EXT_WORKSPACE_ID), [Some(ext)]);
+        assert!(!reconcile_pending(world), "the heal never fires");
+        let blocked = world
+            .run_system_once(|guard: crate::ecs::state::SaveGuard| guard.blocked_by())
+            .expect("guard runs");
+        assert_eq!(blocked, None, "a save is allowed");
+    };
+    let harness =
+        TestHarness::new().with_display(EXT_DISPLAY_ID, ext_bounds(), vec![EXT_WORKSPACE_ID]);
+    harness
+        .mock_state
+        .set_space_fullscreen(EXT_WORKSPACE_ID, true);
+    harness
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |window| {
+            window.is_full_screen = true;
+        })
+        .on_iteration(0, check)
+        .on_iteration(3, check)
+        .on_iteration(5, check)
+        .run(idle(6));
+}
+
+/// Spaces found after startup get what startup gives a Space: a floating
+/// layer, and for a fullscreen Space a row that knows its home.
+#[test]
+fn spaces_found_after_startup_get_a_floating_layer_and_a_home() {
+    const NEW: WorkspaceId = TEST_WORKSPACE_ID + 2;
+    const LATE_FS: WorkspaceId = TEST_WORKSPACE_ID + 101;
+    let mut commands = idle(4);
+    commands[0] = Event::SpaceCreated { space_id: NEW };
+    commands[1] = Event::DisplayConfigured {
+        display_id: TEST_DISPLAY_ID,
+    };
+
+    TestHarness::new()
+        .on_iteration(0, |world, mut state| {
+            let main = display_entity(world, TEST_DISPLAY_ID);
+            assert_eq!(floating_layer_parents(world, NEW), [main]);
+            state.add_display(
+                TEST_DISPLAY_ID,
+                main_bounds(),
+                vec![TEST_WORKSPACE_ID, NEW, LATE_FS],
+            );
+            state.set_space_fullscreen(LATE_FS, true);
+        })
+        .on_iteration(3, |world, _state| {
+            let main = display_entity(world, TEST_DISPLAY_ID);
+            let home = row_entity(world, TEST_WORKSPACE_ID, 0);
+            assert_eq!(row_parents(world, LATE_FS), [Some(main)]);
+            let markers = fullscreen_rows(world, LATE_FS)
+                .into_iter()
+                .map(|(_, _, marker)| marker)
+                .collect::<Vec<_>>();
+            assert_eq!(markers, [Some((home, TEST_WORKSPACE_ID))]);
+            assert_eq!(floating_layer_parents(world, LATE_FS), [main]);
+        })
+        .run(commands);
+}
+
+/// The row of `space` at `virtual_index`.
+fn row_entity(world: &mut World, space: WorkspaceId, virtual_index: u32) -> Entity {
+    world
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(world)
+        .find(|(_, strip)| strip.id() == space && strip.virtual_index == virtual_index)
+        .map_or_else(
+            || panic!("row {virtual_index} of space {space} not found"),
+            |(entity, _)| entity,
+        )
+}
+
+fn row_windows(world: &World, row: Entity) -> Vec<Entity> {
+    world
+        .get::<LayoutStrip>(row)
+        .expect("row exists")
+        .all_windows()
+}
+
+fn in_a_row(world: &mut World, id: WinID) -> bool {
+    let window = find_window_entity(id, world);
+    world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .any(|strip| strip.contains(window))
+}
+
+/// A row: whether it is a fullscreen strip, its windows, and its fullscreen
+/// marker's home row and Space.
+type RowSummary = (bool, Vec<Entity>, Option<(Entity, WorkspaceId)>);
+
+/// Every row of `space`.
+fn fullscreen_rows(world: &mut World, space: WorkspaceId) -> Vec<RowSummary> {
+    world
+        .query::<(&LayoutStrip, Option<&NativeFullscreenMarker>)>()
+        .iter(world)
+        .filter(|(strip, _)| strip.id() == space)
+        .map(|(strip, marker)| {
+            (
+                strip.is_fullscreen(),
+                strip.all_windows(),
+                marker.map(|marker| (marker.layout_strip, marker.workspace_id)),
+            )
+        })
+        .collect()
+}
+
+fn floating_layer_parents(world: &mut World, space: WorkspaceId) -> Vec<Entity> {
+    world
+        .query::<(&FloatingLayer, &ChildOf)>()
+        .iter(world)
+        .filter(|(layer, _)| layer.workspace_id == space)
+        .map(|(_, child)| child.parent())
+        .collect()
 }
 
 fn reconcile_pending(world: &World) -> bool {

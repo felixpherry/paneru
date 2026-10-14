@@ -52,6 +52,8 @@ pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_
 pub use process::MockProcessApi;
 #[cfg(test)]
 pub use windows::MockWindowApi;
+#[cfg(test)]
+pub(crate) use windows::element_alive;
 
 pub(crate) mod app;
 #[cfg(feature = "thumbnails")]
@@ -140,6 +142,8 @@ pub trait WindowManagerApi: Send + Sync {
     fn active_display_space(&self, display_id: CGDirectDisplayID) -> Result<WorkspaceId>;
     /// Returns `true` if the current space on the given display is a native fullscreen space.
     fn is_fullscreen_space(&self, display_id: CGDirectDisplayID) -> bool;
+    /// Whether `space_id` is a native fullscreen Space (Space type 4).
+    fn space_is_fullscreen(&self, space_id: WorkspaceId) -> bool;
     /// Centers the mouse cursor on a given window within its display bounds if it's not already within the window.
     ///
     /// # Arguments
@@ -470,7 +474,11 @@ impl WindowManagerApi for WindowManagerOS {
 
     fn is_fullscreen_space(&self, display_id: CGDirectDisplayID) -> bool {
         self.active_display_space(display_id)
-            .is_ok_and(|space_id| unsafe { SLSSpaceGetType(self.main_cid, space_id) } == 4)
+            .is_ok_and(|space_id| self.space_is_fullscreen(space_id))
+    }
+
+    fn space_is_fullscreen(&self, space_id: WorkspaceId) -> bool {
+        4 == unsafe { SLSSpaceGetType(self.main_cid, space_id) }
     }
 
     /// Centers the mouse cursor on the window if it's not already within the window's bounds.

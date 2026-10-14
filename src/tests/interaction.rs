@@ -8,14 +8,14 @@ use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, ManualStripOffset,
-    NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, BProcess, FocusedMarker, FreshMarker,
+    ManualStripOffset, NativeFullscreenMarker, Position, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
-use crate::manager::{Origin, Size, Window};
-use crate::platform::{Modifiers, WinID};
-use crate::{assert_focused, assert_window_at, assert_window_size};
+use crate::manager::{Application, Origin, Size, Window};
+use crate::platform::{Modifiers, Pid, WinID};
+use crate::{assert_focused, assert_on_workspace, assert_window_at, assert_window_size};
 
 use super::*;
 
@@ -165,6 +165,99 @@ fn native_fullscreen_exit_restores_window_with_extra_row_on_space() {
                 space_id: FULLSCREEN_WORKSPACE_ID,
             },
         ]);
+}
+
+/// A fullscreen row holds its one window. A window opened on that Space tiles
+/// in the row the fullscreen window returns to instead.
+#[test]
+fn new_window_on_a_fullscreen_space_tiles_in_its_home_row() {
+    const FULLSCREEN_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, |world, state| {
+            let focused = world
+                .query_filtered::<Entity, With<FocusedMarker>>()
+                .iter(world)
+                .collect::<Vec<_>>();
+            for entity in focused {
+                world.entity_mut(entity).remove::<FocusedMarker>();
+            }
+
+            state.update_window(0, |window| {
+                window.workspace_id = FULLSCREEN_WORKSPACE_ID;
+                window.is_full_screen = true;
+            });
+            state.activate_workspace(TEST_DISPLAY_ID, FULLSCREEN_WORKSPACE_ID, true);
+        })
+        .on_iteration(1, |world, state| {
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(TEST_PROCESS_ID, FULLSCREEN_WORKSPACE_ID, 5, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(2, |world, _state| {
+            let fullscreen_window = find_window_entity(0, world);
+            let new_window = find_window_entity(5, world);
+            let mut strips = world.query::<&LayoutStrip>();
+            let fullscreen_strip = strips
+                .iter(world)
+                .find(|strip| strip.id() == FULLSCREEN_WORKSPACE_ID)
+                .expect("fullscreen strip");
+            assert_eq!(fullscreen_strip.all_windows(), [fullscreen_window]);
+            assert!(
+                strips
+                    .iter(world)
+                    .any(|strip| strip.id() == TEST_WORKSPACE_ID && strip.contains(new_window)),
+                "the new window tiles in the home row"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// An app with no window when the launch timeout runs out stays known, so its
+/// first window, however late, still tiles.
+#[test]
+fn app_without_a_window_past_the_launch_timeout_still_tiles_its_first_window() {
+    const LATE_PID: Pid = 7;
+
+    let mut harness = TestHarness::new();
+    harness.mock_state.spawn_app(LATE_PID, "late", "LateApp");
+    // A launched process, as the launch notification hands it over.
+    let process = harness.mock_state.create_process(LATE_PID);
+    harness
+        .world()
+        .spawn((FreshMarker, BProcess(Box::new(process))));
+    harness
+        .on_iteration(22, |world, _state| {
+            let apps = world
+                .query::<(&Application, Has<FreshMarker>)>()
+                .iter(world)
+                .filter(|(app, _)| app.pid() == LATE_PID)
+                .map(|(_, fresh)| fresh)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                apps,
+                [false],
+                "the app outlives the launch timeout, without its fresh mark"
+            );
+        })
+        .on_iteration(29, |world, state| {
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(LATE_PID, TEST_WORKSPACE_ID, 50, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(31, |world, _state| {
+            assert_on_workspace!(world, 50, TEST_WORKSPACE_ID);
+        })
+        .run(idle(32));
 }
 
 #[test]

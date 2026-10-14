@@ -19,8 +19,8 @@ use crate::ecs::state::{
 };
 use crate::ecs::workspace::{PreviousStripPosition, RestoredActivation};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Position, RestoreWindowState,
-    SelectedVirtualMarker, SpawnCommandsExt, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, NativeFullscreenMarker, Position,
+    RestoreWindowState, SelectedVirtualMarker, SpawnCommandsExt, Unmanaged,
 };
 use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -504,6 +504,10 @@ pub(super) fn restore_window_state(
     }
 
     let mut restored_strips = 0;
+    // A restored fullscreen row returns its window to the display's first
+    // restored row 0 when it leaves fullscreen.
+    let mut homes: HashMap<Entity, (Entity, WorkspaceId)> = HashMap::new(); // display → home row
+    let mut fullscreen_rows: Vec<(Entity, Entity)> = Vec::new(); // (row, display)
     for planned in &plan.strips {
         let Some((display_entity, display)) = select_display(
             planned.workspace_id,
@@ -574,10 +578,18 @@ pub(super) fn restore_window_state(
             origin: display.bounds().min,
             focus: strip.all_windows().first().copied(),
         };
+        let fullscreen = strip.is_fullscreen();
 
         let mut spawned =
             ctx.commands
                 .spawn_layout_strip(strip, origin, display_entity, is_global_active);
+        if fullscreen {
+            fullscreen_rows.push((spawned.id(), display_entity));
+        } else if planned.virtual_index == 0 {
+            homes
+                .entry(display_entity)
+                .or_insert((spawned.id(), planned.workspace_id));
+        }
 
         if is_global_active {
             spawned.insert(RestoredActivation);
@@ -588,6 +600,18 @@ pub(super) fn restore_window_state(
             spawned.insert(previous);
         }
         restored_strips += 1;
+    }
+    // After the loop: the plan may list a fullscreen row before its home.
+    for (row, display) in fullscreen_rows {
+        if let Some(&(layout_strip, workspace_id)) = homes.get(&display)
+            && let Ok(mut row) = ctx.commands.get_entity(row)
+        {
+            row.try_insert(NativeFullscreenMarker {
+                layout_strip,
+                workspace_id,
+                index: usize::MAX,
+            });
+        }
     }
     info!(
         "Session restore applied: matched={}, strips={}, missing={}, ambiguous={}",

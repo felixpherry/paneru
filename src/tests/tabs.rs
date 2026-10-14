@@ -1,12 +1,14 @@
+use std::time::Duration;
+
 use bevy::prelude::*;
 
-use crate::assert_window_size;
 use crate::commands::{Command, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{ActiveWorkspaceMarker, Bounds, SpawnWindowTrigger};
 use crate::events::Event;
 use crate::platform::WinID;
+use crate::{assert_focused, assert_window_size};
 
 use super::*;
 
@@ -306,4 +308,54 @@ fn test_same_app_same_frame_native_tab_reuses_existing_column() {
             );
         })
         .run(commands);
+}
+
+/// A native tab group left with one member is no tab group: closing that last
+/// window hands focus on like closing any other window.
+#[test]
+fn closing_a_lone_native_tab_hands_focus_on() {
+    let idle = || Event::Command {
+        command: Command::PrintState,
+    };
+    let commands = vec![
+        idle(),
+        idle(),
+        Event::Command {
+            command: Command::Window(Operation::Stack(true)),
+        },
+        idle(),
+        idle(),
+    ];
+
+    let mut harness = TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, |world, state| {
+            // Window 2 opens as a native tab of window 1 and takes focus.
+            spawn_matching_native_tab(world, &state, 1);
+            state.focus_window(2);
+        })
+        .on_iteration(2, |world, state| {
+            let windows = [0, 1, 2].map(|id| find_window_entity(id, world));
+            let strip = world
+                .query::<&LayoutStrip>()
+                .single(world)
+                .expect("getting layout strip");
+            assert_eq!(strip.len(), 1, "one column holds every window");
+            assert!(windows.iter().all(|window| strip.contains(*window)));
+            // The tab closes, leaving a tab group of one: Stack([0, Tabs([1])]).
+            state.os_vanish_window(2);
+            world.despawn(windows[2]);
+            state.window_visible(1, true);
+            state.focus_window(1);
+        })
+        .on_iteration(3, |world, _state| assert_focused!(world, 1));
+    harness.run(commands);
+
+    // Closing window 1 must hand focus on itself: check well short of the
+    // 1-second lost-focus recovery, which would mask a missing hand-off.
+    let window = find_window_entity(1, harness.world());
+    harness.mock_state.os_vanish_window(1);
+    harness.world().despawn(window);
+    harness.advance(Duration::from_millis(60));
+    assert_focused!(harness.world(), 0);
 }

@@ -223,6 +223,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
             workspace::cleanup_unordered_windows
                 .run_if(not(resource_exists::<Initializing>))
                 .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
+            workspace::adopt_stray_windows
+                .run_if(not(resource_exists::<Initializing>))
+                .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
             systems::regroup_stray_native_tabs
                 .run_if(native_tabs_enabled)
                 .run_if(not(resource_exists::<Initializing>))
@@ -483,10 +486,9 @@ pub struct Bounds(pub Size);
 #[derive(Component, Clone, Debug, Deref, DerefMut)]
 pub struct WidthRatio(pub f64);
 
-/// Marks a window entity that is currently on a native macOS fullscreen space.
-/// The window has been removed from its tiled position in the strip.
-/// `order` gives the sequence in which windows went fullscreen (0, 1, 2, …)
-/// so they can be navigated left-to-right in that order after the tiled strip.
+/// On the row of a native fullscreen Space: the row (`layout_strip`, on Space
+/// `workspace_id`) its window returns to at column `index` when the Space goes
+/// away. `usize::MAX` means the end of that row.
 #[derive(Clone, Component, Debug)]
 pub struct NativeFullscreenMarker {
     pub layout_strip: Entity,

@@ -24,13 +24,14 @@ use super::{
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
-use crate::ecs::display::FloatingLayer;
+use crate::ecs::display::spawn_space_rows;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    LowPowerMode, MissionControlActive, NativeFullscreenMarker, Position, ReadDisplayProperties,
+    RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio,
+    WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -141,10 +142,22 @@ pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Command
 
         commands.trigger(ReadDisplayProperties(entity));
 
-        for id in workspaces {
+        // Desktops first, so a fullscreen Space's row can name one as its home.
+        // With no desktop on the display, its fullscreen rows get no marker;
+        // the stray-window step tiles their windows when they leave fullscreen.
+        let mut spaces: Vec<_> = workspaces
+            .into_iter()
+            .map(|id| (window_manager.space_is_fullscreen(id), id))
+            .collect();
+        spaces.sort_by_key(|&(fullscreen, _)| fullscreen);
+        let mut home = None;
+        for (fullscreen, id) in spaces {
             let active = Some(id) == active_space;
-            commands.spawn_layout_strip(LayoutStrip::new(id, 0), origin.0, entity, active);
-            commands.spawn((FloatingLayer::new(id), ChildOf(entity)));
+            let marker = home.filter(|_| fullscreen);
+            let row = spawn_space_rows(&mut commands, id, entity, origin.0, active, marker);
+            if !fullscreen {
+                home.get_or_insert((row, id));
+            }
         }
     }
 
@@ -284,7 +297,12 @@ pub(crate) fn finish_setup(
     windows: Windows,
     applications: Query<&Application>,
     mut bruteforce_tasks: Query<(Entity, &mut BruteforceWindows)>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>, &ChildOf)>,
+    mut workspaces: Query<(
+        &mut LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        Has<NativeFullscreenMarker>,
+        &ChildOf,
+    )>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
@@ -313,7 +331,7 @@ pub(crate) fn finish_setup(
     );
 
     let mut focused_managed_window = false;
-    for (mut strip, active_strip, _) in &mut workspaces {
+    for (mut strip, active_strip, fullscreen, _) in &mut workspaces {
         debug!("space {}: before refresh {strip:?}", strip.id());
         let workspace_windows = window_manager
             .windows_in_workspace(strip.id())
@@ -341,15 +359,27 @@ pub(crate) fn finish_setup(
             continue;
         };
 
-        // Preserve the order - do not flush existing windows.
-        for entity in strip.all_windows() {
-            if !workspace_windows.iter().any(|(_, e)| *e == entity) {
-                strip.remove(entity);
+        if fullscreen {
+            // A fullscreen Space shows one window. A fullscreen strip lets the
+            // is_fullscreen() guards (virtual switch, dynamic rows) see it.
+            if let Some(&(_, entity)) = workspace_windows
+                .iter()
+                .find(|(window, _)| window.is_full_screen())
+                .or(workspace_windows.first())
+            {
+                *strip = LayoutStrip::fullscreen(strip.id(), entity);
             }
-        }
-        for (_, entity) in workspace_windows {
-            if !strip.contains(entity) {
-                strip.append(entity);
+        } else {
+            // Preserve the order - do not flush existing windows.
+            for entity in strip.all_windows() {
+                if !workspace_windows.iter().any(|(_, e)| *e == entity) {
+                    strip.remove(entity);
+                }
+            }
+            for (_, entity) in workspace_windows {
+                if !strip.contains(entity) {
+                    strip.append(entity);
+                }
             }
         }
         debug!("space {}: after refresh {strip:?}", strip.id());
@@ -382,7 +412,7 @@ pub(crate) fn finish_setup(
 /// observes the application for events, and adds its windows to the manager.
 /// This system processes `BProcess` entities marked with `FreshMarker`.
 /// If the process is not yet ready, it continues observing it. If ready, it attempts to create and observe an `Application`.
-/// A `Timeout` is added to the application if it takes too long to become observable.
+/// A `Timeout` drops the application's `FreshMarker` (not the application) if it shows no window in time.
 ///
 /// # Arguments
 ///
@@ -431,14 +461,9 @@ pub(super) fn add_launched_process(
         };
 
         if app.observe().is_ok_and(|good| good) {
-            let timeout = Timeout::new(
-                APP_OBSERVABLE_TIMEOUT,
-                Some(format!(
-                    "{app} did not become observable in {}s.",
-                    APP_OBSERVABLE_TIMEOUT.as_secs()
-                )),
-                &mut commands,
-            );
+            // On expiry only the fresh mark goes. The app stays, so a window it
+            // opens later still arrives through its window-created notification.
+            let timeout = Timeout::for_component::<FreshMarker>(APP_OBSERVABLE_TIMEOUT);
             commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
         } else {
             debug!("failed to register some observers {}", process.name());

@@ -1,7 +1,7 @@
 use bevy::app::{App, Plugin, PostUpdate, PreUpdate, Update};
 use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut, Ref};
 use bevy::ecs::component::Component;
-use bevy::ecs::entity::{Entity, EntityHashMap};
+use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, RemovedComponents};
 use bevy::ecs::message::MessageReader;
@@ -22,6 +22,7 @@ use crate::commands::{
     Direction, MoveFocus, Operation, filter_window_operations, get_window_in_direction,
 };
 use crate::config::Config;
+use crate::ecs::display::spawn_space_rows;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
 use crate::ecs::params::{ActiveDisplay, WindowCtx, Windows};
@@ -631,9 +632,16 @@ fn workspace_created_handler(
         }
         debug!("Workspace create {space_id}");
         let (active_display, display_entity) = *active_display;
-        let strip = LayoutStrip::new(*space_id, 0);
         let origin = active_display.bounds().min;
-        commands.spawn_layout_strip(strip, origin, display_entity, false);
+        // SpaceCreated is only sent for desktop Spaces, so no fullscreen home.
+        spawn_space_rows(
+            &mut commands,
+            *space_id,
+            display_entity,
+            origin,
+            false,
+            None,
+        );
     }
 }
 
@@ -840,6 +848,83 @@ pub(crate) fn cleanup_unordered_windows(
                 source: DestroySource::Accessibility,
             }));
         }
+    }
+}
+
+/// Tiles a managed window that ended up in no row — its desktop was removed,
+/// its display unplugged, it left native fullscreen, or its row was pruned —
+/// into the shown row of the Space macOS lists it on.
+///
+/// Only a window stray on two consecutive passes is adopted. A new window is
+/// tiled by `apply_window_positions` the frame it appears, so it never
+/// qualifies; that keeps this clear of the new-window race 6bf2ea4 fixed in
+/// `detect_moved_windows`, whose filter stays as it is.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn adopt_stray_windows(
+    windows: Query<(Entity, &Window, Option<&LaunchedInto>), Without<Unmanaged>>,
+    mut rows: Query<(&mut LayoutStrip, Has<SelectedVirtualMarker>, Has<ChildOf>)>,
+    reconcile: Res<crate::ecs::display::DisplayReconcileState>,
+    window_manager: Res<WindowManager>,
+    time: Res<Time>,
+    mut last_strays: Local<EntityHashSet>,
+    mut commands: Commands,
+) {
+    if reconcile.is_settling() {
+        last_strays.clear(); // a skipped pass breaks "consecutive"
+        return;
+    }
+    let strays: EntityHashSet = windows
+        .iter()
+        .filter(|(entity, _, launched)| {
+            !launched.is_some_and(|launched| launched.settling(time.elapsed()))
+                && !rows.iter().any(|(strip, ..)| strip.contains(*entity))
+        })
+        .map(|(entity, ..)| entity)
+        .collect();
+    let confirmed: Vec<Entity> = strays.intersection(&last_strays).copied().collect();
+    *last_strays = strays; // a window no Space lists stays in the set
+    if confirmed.is_empty() {
+        return;
+    }
+
+    // One read per Space, and only when there is something to place.
+    let listed: Vec<(WorkspaceId, Vec<WinID>)> = rows
+        .iter()
+        .filter(|(_, _, parented)| *parented)
+        .map(|(strip, ..)| strip.id())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter_map(|space| Some((space, window_manager.windows_in_workspace(space).ok()?)))
+        .collect();
+
+    for entity in confirmed {
+        let Ok((_, window, _)) = windows.get(entity) else {
+            continue;
+        };
+        let Some(space) = listed
+            .iter()
+            .find_map(|(space, ids)| ids.contains(&window.id()).then_some(*space))
+        else {
+            continue;
+        };
+        // The Space's shown row, else its lowest; a fullscreen row holds its one window.
+        let Some((mut strip, ..)) = rows
+            .iter_mut()
+            .filter(|(strip, _, parented)| *parented && strip.id() == space)
+            .min_by_key(|(strip, selected, _)| (!*selected, strip.virtual_index))
+        else {
+            continue;
+        };
+        if strip.is_fullscreen() {
+            continue;
+        }
+        debug!(
+            "adopting stray window {} into space {space} row {}",
+            window.id(),
+            strip.virtual_index
+        );
+        strip.append(entity);
+        commands.reshuffle_around(entity);
     }
 }
 
