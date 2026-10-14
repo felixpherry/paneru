@@ -838,6 +838,52 @@ fn autorelease_runner(mut app: BevyApp) -> bevy::app::AppExit {
     }
 }
 
+/// The app the daemon and the test harness share: plugins, common resources
+/// and the single-threaded executor. Callers add only what is theirs.
+pub(crate) fn build_core_app(app: &mut BevyApp) {
+    app.add_plugins(MinimalPlugins)
+        // `add_message`, not `init_resource`: the latter never registers the
+        // buffer with bevy's `MessageRegistry`, so it's never double-buffered
+        // and grows unbounded instead — every event lived for the process's
+        // lifetime. Messages now live two frames, which every reader here
+        // tolerates: readers gated on `not_swiping` or IPC subscribers would
+        // rather drop a missed frame than act on a backlog.
+        .add_message::<Event>()
+        .insert_resource(Time::<Virtual>::from_max_delta(Duration::from_secs(10)))
+        .insert_resource(SkipReshuffle(false))
+        .insert_resource(MissionControlActive(false))
+        .insert_resource(FocusFollowsMouse(None))
+        .insert_resource(Initializing)
+        .add_plugins(mouse::MouseEventsPlugin)
+        .add_plugins(scroll::ScrollEventsPlugin)
+        .add_plugins(workspace::WorkspaceEventsPlugin)
+        .add_plugins(layout::LayoutEventsPlugin)
+        .add_plugins(overview::OverviewPlugin)
+        .add_plugins(focus::FocusEventsPlugin)
+        .add_plugins(display::DisplayEventsPlugin)
+        .add_plugins((register_triggers, register_systems, register_commands));
+
+    // Run every schedule inline rather than fanning systems out across the task
+    // pool: the task-pool handoff measured ~45% of main-thread time against
+    // ~16% actually spent on accessibility calls, dropping to ~10% once
+    // inlined. The expensive systems here all take `&mut Window` and are
+    // already mutually exclusive, so the fan-out bought little; genuine
+    // parallelism (`par_iter_mut`) still goes through `ComputeTaskPool`
+    // directly. `First`/`Last` are included even though unused because an
+    // empty schedule still costs a task-pool scope per frame.
+    for label in [
+        First.intern(),
+        PreUpdate.intern(),
+        Update.intern(),
+        PostUpdate.intern(),
+        Last.intern(),
+    ] {
+        app.edit_schedule(label, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
+    }
+}
+
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
     crate::manager::app::bound_ax_messaging_timeout()?;
 
@@ -875,53 +921,12 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     }
 
     let mut app = BevyApp::new();
-
-    app.add_plugins(MinimalPlugins)
-        // `add_message`, not `init_resource`: the latter never registers the
-        // buffer with bevy's `MessageRegistry`, so it's never double-buffered
-        // and grows unbounded instead — every event lived for the process's
-        // lifetime. Messages now live two frames, which every reader here
-        // tolerates: readers gated on `not_swiping` or IPC subscribers would
-        // rather drop a missed frame than act on a backlog.
-        .add_message::<Event>()
-        .insert_resource(Time::<Virtual>::from_max_delta(Duration::from_secs(10)))
-        .insert_resource(WindowManager(window_manager))
-        .insert_resource(SkipReshuffle(false))
+    build_core_app(&mut app);
+    app.insert_resource(WindowManager(window_manager))
         .insert_resource(SystemTheme {
             is_dark: crate::util::is_dark_mode(),
         })
-        .insert_resource(MissionControlActive(false))
-        .insert_resource(FocusFollowsMouse(None))
-        .insert_resource(Initializing)
-        .insert_non_send(watcher)
-        .add_plugins(mouse::MouseEventsPlugin)
-        .add_plugins(scroll::ScrollEventsPlugin)
-        .add_plugins(workspace::WorkspaceEventsPlugin)
-        .add_plugins(layout::LayoutEventsPlugin)
-        .add_plugins(overview::OverviewPlugin)
-        .add_plugins(focus::FocusEventsPlugin)
-        .add_plugins(display::DisplayEventsPlugin)
-        .add_plugins((register_triggers, register_systems, register_commands));
-
-    // Run every schedule inline rather than fanning systems out across the task
-    // pool: the task-pool handoff measured ~45% of main-thread time against
-    // ~16% actually spent on accessibility calls, dropping to ~10% once
-    // inlined. The expensive systems here all take `&mut Window` and are
-    // already mutually exclusive, so the fan-out bought little; genuine
-    // parallelism (`par_iter_mut`) still goes through `ComputeTaskPool`
-    // directly. `First`/`Last` are included even though unused because an
-    // empty schedule still costs a task-pool scope per frame.
-    for label in [
-        First.intern(),
-        PreUpdate.intern(),
-        Update.intern(),
-        PostUpdate.intern(),
-        Last.intern(),
-    ] {
-        app.edit_schedule(label, |schedule| {
-            schedule.set_executor(SingleThreadedExecutor::new());
-        });
-    }
+        .insert_non_send(watcher);
 
     app.set_runner(autorelease_runner);
 

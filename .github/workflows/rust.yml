@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "**" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "testing" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,6 +15,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - run: rustup update
+    - run: cargo fmt --check
+    - run: cargo clippy --all-targets -- -D warnings
+    - run: cargo test --all-targets
     - run: cargo build --release --verbose
     - uses: actions/upload-artifact@v4
       with:

@@ -7,19 +7,20 @@ This document provides project-specific guidance for AI agents contributing to P
 Paneru is built on Bevy and strictly follows Data-Driven Design (ECS). **Always prioritize Bevy ECS rules over conventional Rust patterns**:
 *   Avoid traditional Object-Oriented patterns, abstract trait hierarchies, or "god structs" holding internal state machines.
 *   Model state as small, queryable Components and compose functionality through Systems and Observers.
-*   **Marker Components:** Use markers extensively for filtering and state tracking (e.g., `ActiveWorkspaceMarker`, `FocusedMarker`, `FreshMarker`, `Unmanaged`). Most markers are found in `src/ecs.rs` or `src/ecs/mod.rs`.
+*   **Marker Components:** Use markers extensively for filtering and state tracking (e.g., `ActiveWorkspaceMarker`, `FocusedMarker`, `FreshMarker`, `Unmanaged`). Most markers are found in `src/ecs.rs`.
 *   **Avoid Unbounded / Constantly Running Systems:** Systems should not run unconditionally on every tick if there is nothing to process.
     *   **Use `Populated<Query<...>>` instead of `Query<...>`** where a system only acts when matching entities exist. Bevy automatically adds a run condition for `Populated`, ensuring the system is not even scheduled if the query is empty.
     *   Pair queries with change filters (`Changed<T>`, `Added<T>`) and explicit run conditions (`run_if(...)`) so systems remain idle when state is static.
-*   **Triggers & Observers:** Prefer Bevy's observer pattern for reactive logic. See `src/ecs/triggers.rs` and `src/ecs/workspace.rs` for examples like `SpawnWindowTrigger` and `WMEventTrigger`.
-*   **System Grouping:** Systems are registered in `src/ecs.rs` via `register_systems`. Follow the existing schedule-based organization (`PreUpdate`, `Update`, `PostUpdate`).
+*   **Triggers & Observers:** Prefer Bevy's observer pattern for reactive logic. See `src/ecs/triggers.rs` and `src/ecs/workspace.rs` for examples like `SpawnWindowTrigger` and `SendMessageTrigger`.
+*   **System Grouping:** Systems are registered in `src/ecs.rs` via `register_systems`. Follow the existing schedule-based organization (`PreUpdate`, `Update`, `PostUpdate`): put each system in one of the phase sets `PreUpdateSet`, `UpdateSet` or `PostUpdateSet`. Order across sets comes from the set chain; a `.after()` that points into another set can form a schedule cycle.
 *   **System Params:** Use custom system parameters like `Windows` and `ActiveDisplay` (defined in `src/ecs/params.rs`) to simplify queries.
 
 ## 2. macOS & AppKit Integration (The Bridge)
 
 *   **Main Thread Constraint:** All AppKit/CoreGraphics calls MUST happen on the main thread.
-*   **NonSend Resources:** Use `NonSend` and `NonSendMut` for resources that are not thread-safe (e.g., `WindowManager`, `OverlayManager`).
-*   **FFI Wrappers:** Interact with macOS via the abstractions in `src/manager/` and `src/platform/`. Avoid direct `objc2` or `icrate` calls in ECS systems; use the `WindowManager` API.
+*   **Single-Threaded Schedules:** The main-thread guarantee is the `SingleThreadedExecutor` that `build_core_app` (`src/ecs.rs`) sets on every main schedule (`First` through `Last`). Never switch these schedules to the multi-threaded executor.
+*   **NonSend Resources:** Use `NonSend` and `NonSendMut` for resources that are not thread-safe (e.g., `OverlayManager`, `PlatformCallbacks`). `WindowManager` is a plain `Resource`; its `WindowManagerApi` trait is `Send + Sync`.
+*   **FFI Wrappers:** Interact with macOS via the abstractions in `src/manager/` and `src/platform/`. Avoid direct `objc2` calls in ECS systems; use the `WindowManager` API.
 *   **Change Detection:** Use `Changed<T>` to trigger expensive macOS API updates (like window repositioning) only when the ECS state actually changes.
 *   **The Lua Worker:** The scripting runtime (`src/lua/worker.rs`, `lua` feature) runs on its own thread — handlers are user code of unbounded duration and must never stall `pump_events`. Anything crossing that boundary must be plain `Send` data, never a Lua value or an ECS borrow; world access from a script goes through the `serve_lua_queries` round-trip. If you add a main-thread-only FFI call to a path a script can reach (`resolve_chord` is the existing example), compute it on the main thread and cache it — see `config::prime_virtual_keymap`.
 
@@ -39,18 +40,36 @@ Paneru is built on Bevy and strictly follows Data-Driven Design (ECS). **Always 
 ## 5. Testing Strategy
 
 *   **Mocking:** When adding features that interact with macOS, ensure the logic is separable so it can be tested with a mock `WindowManager`.
-*   **Harness-Based Integration Tests:** Unit and integration tests drive an isolated Bevy `World` via `TestHarness`. Tests should adhere to the established harness structure:
+*   **Harness-Based Integration Tests:** Unit and integration tests drive an isolated Bevy `World` via `TestHarness`, which builds the same core app as the daemon (`build_core_app`). Tests should adhere to the established harness structure:
     1. Define a list of input events/commands (`vec![Event::..., Event::Command { ... }]`).
     2. Configure the harness (e.g., `TestHarness::new().with_windows(n)` or `.with_config(...)`).
-    3. Assert expected world/state outcomes on specific, 1-indexed iterations using `.on_iteration(step, |world, state| { ... })`.
+    3. Assert expected world/state outcomes on specific iterations using `.on_iteration(step, |world, state| { ... })`. Steps count from 0: `on_iteration(n, ...)` runs after command n, so the first command is step 0. `run` panics if a check's step is never reached.
     4. Execute via `.run(commands)`.
 
-    **Example:**
+    **Example** (from `src/tests/focus_or_virtual.rs`; `active_virtual_index` is a helper in that file):
     ```rust
     #[test]
-    fn test_stack_focus_or_switch_virtual() {
+    fn test_focus_or_virtual_south_focuses_stack_sibling_before_switching_workspace() {
         let commands = vec![
             Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::Focus(Direction::East)),
+            },
+            Event::Command {
+                command: Command::Window(Operation::Stack(true)),
+            },
+            // Jump to VW1 and straight back so it exists for the eventual
+            // fallback switch, without relying on auto-create being enabled.
+            Event::Command {
+                command: Command::Window(Operation::VirtualNumber(1)),
+            },
+            Event::Command {
+                command: Command::Window(Operation::VirtualNumber(0)),
+            },
+            // Focus window 0 (top of the 2-item stack), then press South twice.
+            Event::Command {
+                command: Command::Window(Operation::Focus(Direction::First)),
+            },
             Event::Command {
                 command: Command::Window(Operation::FocusOrVirtual(Direction::South)),
             },
@@ -61,14 +80,24 @@ Paneru is built on Bevy and strictly follows Data-Driven Design (ECS). **Always 
 
         TestHarness::new()
             .with_windows(2)
-            .on_iteration(1, |world, _state| {
-                // First step: focus moves to sibling window in stack
+            .on_iteration(6, |world, _state| {
+                // First South: a sibling exists below window 0 in the stack, so
+                // focus must move to it instead of switching virtual workspace.
                 assert_focused!(world, 1);
-                assert_eq!(active_virtual_index(world), 0);
+                assert_eq!(
+                    active_virtual_index(world),
+                    0,
+                    "focusing a stack sibling must not switch virtual workspace"
+                );
             })
-            .on_iteration(2, |world, _state| {
-                // Second step: at bottom of stack, falls through to workspace switch
-                assert_eq!(active_virtual_index(world), 1);
+            .on_iteration(7, |world, _state| {
+                // Second South: window 1 is the last stack item, nothing left to
+                // focus, so this must fall through to switching workspaces.
+                assert_eq!(
+                    active_virtual_index(world),
+                    1,
+                    "with nothing left to focus, South must fall through to switching workspace"
+                );
             })
             .run(commands);
     }
@@ -83,7 +112,7 @@ Before concluding a task, creating a commit, or presenting work as complete, age
    ```sh
    cargo fmt
    ```
-   Ensures all code across the workspace complies with standard formatting rules and contains proper trailing newlines. Verify with `cargo fmt --check`.
+   Ensures all code in the crate complies with standard formatting rules and contains proper trailing newlines. Verify with `cargo fmt --check`.
 
 2. **Lint with Clippy:**
    ```sh
@@ -95,10 +124,16 @@ Before concluding a task, creating a commit, or presenting work as complete, age
    ```sh
    cargo test --all-targets
    ```
-   Ensure the complete test suite passes without regressions across all packages in the workspace. For targeted debugging of a specific test:
+   Ensure the complete test suite passes without regressions across the crate. For targeted debugging of a specific test:
    ```sh
    RUST_LOG=debug cargo test <test_name> -- --nocapture
    ```
+
+4. **Live Check (when the change affects the running daemon):**
+   ```sh
+   scripts/install.sh
+   ```
+   Builds with `cargo install --locked`, signs with the `paneru-dev` identity so macOS keeps the Accessibility and Screen Recording grants, restarts the daemon and prints the signature. The one-time certificate setup is in README › "Keeping permissions across rebuilds".
 
 ## 7. Contribution Workflow
 

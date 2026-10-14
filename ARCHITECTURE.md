@@ -2,13 +2,15 @@
 
 This document provides a high-level overview of Paneru's architecture for contributors. Paneru is a macOS window manager built using the **Bevy Game Engine** and its **Entity Component System (ECS)**.
 
+The behaviour this fork is expected to keep is written down in [`.agents/RECORD.md`](.agents/RECORD.md).
+
 ## 1. High-Level Overview
 
 Paneru manages macOS windows as a **sliding strip** (inspired by Niri and PaperWM). The core design philosophy is **Data-Driven/ECS**: instead of managing windows as complex objects with internal state, we represent the "World" as a collection of simple data components (Windows, Displays, Workspaces) that are processed by systems.
 
 The primary problem Paneru solves is providing a predictable, stable, and ergonomic tiling experience on macOS. By using Bevy's ECS, we gain:
 - **Declarative Logic:** Systems react to changes in window properties (e.g., `Changed<Position>`).
-- **High Performance:** Parallel system execution and efficient change detection.
+- **High Performance:** Efficient change detection and reactive scheduling. The main schedules run single-threaded.
 - **Modularity:** Functionality is divided into decoupled plugins and systems.
 
 ## 2. The Bevy Bridge
@@ -26,13 +28,13 @@ Bevy is typically used for games, so Paneru implements a custom bridge to intera
 2.  **Commit Systems:** In the `PostUpdate` phase, specialized systems like `commit_window_position` and `commit_window_size` identify windows that need updating.
 3.  **FFI Calls:** These systems call methods on the `Window` trait object (implemented by `WindowOS` in `src/manager/windows.rs`), which performs the actual accessibility API calls to move or resize the physical macOS window.
 
-**Note:** All AppKit/Accessibility calls must happen on the **Main Thread**. Paneru ensures this by using `NonSend` resources and executing critical synchronization systems on the main thread.
+**Note:** All AppKit/Accessibility calls must happen on the **Main Thread**. Paneru ensures this with the single-threaded executor that `build_core_app` (`src/ecs.rs`) sets on every main schedule, `First` through `Last`, so every system runs on the main thread. AppKit objects that aren't `Send` (`OverlayManager`, `PlatformCallbacks`, `OverviewRenderer`) are `NonSend` resources.
 
 ### The Lua Worker (optional `lua` feature)
 
 The embedded scripting runtime is the one deliberate exception to "everything interesting happens on the main thread". A handler is arbitrary user code of unbounded duration, and `pump_events` is itself main-thread-pinned, so running handlers inline meant a slow script stalled the frame clock. `src/lua/worker.rs` runs the interpreter on a dedicated thread instead:
 
-- **Main → worker:** `dispatch_lua_events` and `command_lua_handler` extract plain data (`LuaEvent`, `StateSnapshot`) out of the world and send it over an unbounded channel. Neither ever blocks.
+- **Main → worker:** `dispatch_lua_events` sends `LuaEvent`s and `command_lua_handler` sends the ids of triggered binds, both plain data, over an unbounded channel. Neither ever blocks.
 - **Worker → main:** `drain_lua_outbox` non-blockingly drains queued `Command`s and flash messages onto the command bus, one frame behind.
 - **The query round-trip:** `paneru.query*` still reads the *live* world. The worker sends a request carrying a reply channel and blocks on it; `serve_lua_queries` answers it from `QueryStateParams` in `PreUpdate` (before the pump) and again in `PostUpdate`. Shutdown drops the request queue, which unblocks any waiting handler with an error rather than a hang.
 
@@ -54,11 +56,18 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 | `src/manager/` | OS-agnostic traits (`WindowApi`, `ProcessApi`) and their macOS implementations (`WindowOS`). |
 | `src/platform/` | Low-level macOS FFI, event loop integration, and workspace/input hooks. |
 | `src/config/` | Configuration parsing, validation, and hot-reloading logic. |
-| `src/commands.rs` | Implementation of CLI subcommands. |
+| `src/commands.rs` | In-daemon command handlers. The CLI subcommands are the enum in `src/main.rs`. |
 | `src/client.rs` | The CLI side of the IPC protocol, and the only place JSON is produced. |
 | `src/reader.rs` | The daemon side: owns the Mach service and turns requests into events. |
-| `crates/mach_ipc` | Typed channels over Mach ports; the transport itself. Async and blocking spellings of each operation, on `SendPort`/`RecvPort`. |
+| `src/types/wire.rs` | The IPC protocol: typed channels over Mach ports. Re-exports `SendPort`/`RecvPort` from the `async-mach-ports` crate, which owns the transport. |
+| `src/types/`, `src/lib.rs` | The shared library: wire types, command definitions and the shared Lua API. Also built as the loadable Lua `module` (`cdylib`). |
+| `src/lua/`, `src/lua.rs` | The optional embedded Lua runtime, its worker thread and the Bevy plugin that wires it in. |
 | `src/overlay.rs` | Logic for drawing active window borders and inactive window dimming. |
+| `src/overlay/` | The overview's window: the Core Animation layer tree it draws into. |
+| `src/ecs/overview.rs` | The overview: every virtual workspace row of the active display, zoomed out. |
+| `src/manager/capture.rs` | Overview thumbnails and desktop picture via `ScreenCaptureKit`. Best effort: without Screen Recording, tiles fall back to icon and title. |
+| `src/ecs/display.rs` | Display changes: reconciling the display set against macOS and moving rows and windows between displays. |
+| `src/ecs/mouse.rs` | Pointer events: mouse moves, clicks, mouse resize and edge warps. |
 
 ## 4. Key Data Entities
 
@@ -71,9 +80,12 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 - **`FocusedMarker`:** Identifies the currently focused window.
 - **`ActiveWorkspaceMarker`**: Identifies the currently active workspace.
 - **`SelectedVirtualMarker`**: Marks a virtual workspace that is currently selected by the user.
-- **`NativeFullscreenMarker`**: Marks a window that is in macOS native fullscreen mode.
+- **`NativeFullscreenMarker`**: Marks the row of a macOS native-fullscreen Space, and points at the row and index its window came from.
 - **`Unmanaged`:** An enum identifying windows that are `Floating`, `Minimized`, or `Hidden`.
 - **`RepositionMarker` / `ResizeMarker`**: Used to signal that a window needs to be moved or resized.
+
+### Display → row → window
+A `Display` entity has child rows (`LayoutStrip`), one per macOS Space and virtual workspace index, plus one `FloatingLayer` per Space. A row lists window entities in columns; windows themselves are children of their `Application`. `ActiveDisplayMarker` marks one display. `ActiveWorkspaceMarker` marks one row in the whole world. `SelectedVirtualMarker` marks the shown row of each Space (see `spawn_layout_strip` in `src/ecs.rs`).
 
 ### Resources
 - **`WindowManager`:** A wrapper for the global window management state and OS bridge.
@@ -87,7 +99,7 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 
 - **Main Thread Only:** Any interaction with `objc2`, `AppKit`, or `Accessibility` APIs **must** occur on the main thread.
 - **ECS as Source of Truth:** Tiling logic must operate on ECS components (`WidthRatio`, `LayoutStrip`). The physical macOS window state should be a reflection of the ECS state, not the other way around.
-- **Pure Layout:** Layout math (in `layout.rs`) should remain as pure as possible, operating on coordinates and ratios rather than directly calling OS APIs.
+- **Pure Layout:** Layout math (in `src/ecs/layout.rs`) should remain as pure as possible, operating on coordinates and ratios rather than directly calling OS APIs.
 - **Bounded Restore:** Saved session state is only consulted during startup restore. After `SessionRestore` expires, normal config and window-rule placement owns newly discovered windows.
 - **Reactive Power Saving:** Systems should use Bevy's reactive scheduling to avoid CPU usage when no windows are moving or events are occurring.
 
@@ -130,7 +142,7 @@ graph TD
     F -->|Set RepositionMarker| E
     E -->|PostUpdate| G(commit_window_position)
     G -->|FFI Call| A
-    H[CommandReader] -->|Unix Socket| C
+    H[CommandReader] -->|Mach port| C
     S[PaneruState file] -->|Startup load| R(session restore)
     R -->|Rebuild saved strips| E
     E -->|Periodic / exit save| S
@@ -138,7 +150,7 @@ graph TD
 
 ## 8. Testing Strategy
 
-1.  **Pure Unit Tests:** Located in `src/tests.rs` and alongside modules. These test layout math and configuration parsing without requiring a macOS environment.
+1.  **Pure Unit Tests:** Located in `src/tests/` (harness tests, built on `src/tests/harness.rs` and `src/tests/mocks.rs`) and alongside modules. These test layout math and configuration parsing without requiring a macOS environment.
 2.  **ECS Integration Tests:** Use Bevy's `App` or `World` to drive systems in isolation. macOS APIs are typically mocked via the `WindowApi` and `WindowManagerApi` traits.
 3.  **Session Restore Tests:** `src/tests/session_restore.rs` covers restore planning, missing-window compaction, startup grace behavior, config precedence, virtual workspace restoration, and multi-display fallback.
 4.  **FFI Verification:** Manual or semi-automated tests on macOS to ensure the Accessibility API calls behave as expected with native windows.

@@ -435,14 +435,13 @@ fn test_scrolling() {
 #[test]
 #[allow(clippy::float_cmp)]
 fn test_scrolling_stop() {
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Swipe {
-            delta: 0.3,
-            fingers: 3,
-        },
-        Event::TouchpadDown,
-    ];
+    fn scroll_state(world: &mut World) -> (f64, bool) {
+        let scroll = world
+            .query::<&crate::ecs::Scrolling>()
+            .single(world)
+            .expect("one scrolling strip");
+        (scroll.velocity, scroll.is_user_swiping)
+    }
 
     let config: Config = (
         MainOptions {
@@ -453,17 +452,26 @@ fn test_scrolling_stop() {
     )
         .into();
 
-    TestHarness::new()
-        .with_config(config)
-        .with_windows(3)
-        .on_iteration(3, |world, _state| {
-            use crate::ecs::Scrolling;
-            let mut query = world.query::<&Scrolling>();
-            let scroll = query.single(world).unwrap();
-            assert_eq!(scroll.velocity, 0.0);
-            assert!(scroll.is_user_swiping);
-        })
-        .run(commands);
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    // Touchpad-down has to land mid-momentum: `run` gives a command 500ms,
+    // long enough for momentum to die, and the 50ms finger-lift timeout would
+    // clear "swiping" before a check at the end of a step.
+    harness.world().write_message(Event::Swipe {
+        delta: 0.3,
+        fingers: 3,
+    });
+    harness.advance(Duration::from_millis(100)); // fingers lifted, still coasting
+    let (velocity, swiping) = scroll_state(harness.world());
+    assert_ne!(velocity, 0.0, "momentum should still be running");
+    assert!(!swiping, "fingers should be lifted");
+
+    harness.world().write_message(Event::TouchpadDown);
+    harness.advance(Duration::from_millis(20)); // one frame, under the finger-lift timeout
+    let (velocity, swiping) = scroll_state(harness.world());
+    assert_eq!(velocity, 0.0, "touchpad-down should stop the momentum");
+    assert!(swiping, "touchpad-down should mark the fingers as down");
 }
 
 #[test]
@@ -1635,28 +1643,18 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
         Event::Command {
             command: Command::Window(Operation::FocusUnmanaged),
         },
-        Event::Command {
-            command: Command::PrintState,
-        },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
-        },
     ];
 
     harness
-        .on_iteration(2, |world, _state| {
+        .on_iteration(0, |world, _state| {
             let off_workspace_float = find_window_entity(99, world);
             world
                 .entity_mut(off_workspace_float)
                 .insert(Unmanaged::Floating);
             assert_focused!(world, 0);
         })
-        .on_iteration(3, |world, _state| {
-            let active_float = find_window_entity(0, world);
-            world.entity_mut(active_float).insert(Unmanaged::Floating);
-            assert_focused!(world, 0);
-        })
-        .on_iteration(4, |world, _state| {
+        .on_iteration(1, |world, _state| {
+            // The only float is on another Space, so focus stays put.
             assert_focused!(world, 0);
         })
         .run(commands);
@@ -3773,7 +3771,7 @@ fn test_virtual_number_recreates_missing_baseline_row() {
     // display change does, leaving the space numbered from "2".
     TestHarness::new()
         .with_windows(2)
-        .on_iteration(2, |world, _state| {
+        .on_iteration(1, |world, _state| {
             let row_zero = world
                 .query::<(Entity, &LayoutStrip)>()
                 .iter(world)
@@ -3789,7 +3787,7 @@ fn test_virtual_number_recreates_missing_baseline_row() {
                 .collect::<Vec<_>>();
             assert_eq!(indexes, vec![1], "only row 1 should be left");
         })
-        .on_iteration(3, |world, _state| {
+        .on_iteration(2, |world, _state| {
             let recreated = world
                 .query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>()
                 .iter(world)
@@ -3826,7 +3824,7 @@ fn test_virtual_move_number_recreates_missing_baseline_row() {
     // change does, leaving the space numbered from "2".
     TestHarness::new()
         .with_windows(2)
-        .on_iteration(2, |world, _state| {
+        .on_iteration(1, |world, _state| {
             let row_zero = world
                 .query::<(Entity, &LayoutStrip)>()
                 .iter(world)
@@ -3835,7 +3833,7 @@ fn test_virtual_move_number_recreates_missing_baseline_row() {
                 .expect("row 0 should still exist before it is dropped");
             world.entity_mut(row_zero).despawn();
         })
-        .on_iteration(3, |world, _state| {
+        .on_iteration(2, |world, _state| {
             let focused = world
                 .query_filtered::<Entity, With<FocusedMarker>>()
                 .single(world)

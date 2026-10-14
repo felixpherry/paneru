@@ -7,20 +7,9 @@ use bevy::tasks::{AsyncComputeTaskPool, TaskPoolBuilder};
 use bevy::time::TimeUpdateStrategy;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-use crate::commands::register_commands;
 use crate::config::Config;
-use crate::ecs::display::DisplayEventsPlugin;
-use crate::ecs::focus::FocusEventsPlugin;
-use crate::ecs::layout::LayoutEventsPlugin;
-use crate::ecs::mouse::MouseEventsPlugin;
-use crate::ecs::overview::OverviewPlugin;
-use crate::ecs::scroll::ScrollEventsPlugin;
 use crate::ecs::state::PaneruState;
-use crate::ecs::workspace::WorkspaceEventsPlugin;
-use crate::ecs::{
-    BProcess, ExistingMarker, FocusFollowsMouse, Initializing, MissionControlActive, SkipReshuffle,
-    SpawnWindowTrigger, register_systems, register_triggers,
-};
+use crate::ecs::{BProcess, ExistingMarker, SpawnWindowTrigger};
 use crate::events::Event;
 use crate::manager::{Window, WindowManager};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -209,7 +198,12 @@ impl TestHarness {
         }
     }
 
+    /// Sends each command, plays it out for [`COMMAND_WINDOW`], then runs the
+    /// check registered for that step (steps count from 0). Panics if a
+    /// registered check never ran, so a check past the last command can't
+    /// pass silently.
     pub(crate) fn run(&mut self, commands: Vec<Event>) {
+        let count = commands.len();
         for (iteration, command) in commands.into_iter().enumerate() {
             self.app.world_mut().write_message::<Event>(command);
 
@@ -222,10 +216,17 @@ impl TestHarness {
                 }
             }
 
-            if let Some(verifier) = self.verifiers.get_mut(&iteration) {
+            if let Some(mut verifier) = self.verifiers.remove(&iteration) {
                 verifier(self.app.world_mut(), self.mock_state.clone());
             }
         }
+
+        let mut never_ran: Vec<usize> = self.verifiers.keys().copied().collect();
+        never_ran.sort_unstable();
+        assert!(
+            never_ran.is_empty(),
+            "check registered for step {never_ran:?} never ran ({count} commands; steps count from 0)"
+        );
     }
 }
 
@@ -254,24 +255,10 @@ fn setup_world() -> App {
         assert!(AsyncComputeTaskPool::try_get().is_some());
     });
     let mut bevy_app = App::new();
+    crate::ecs::build_core_app(&mut bevy_app);
     bevy_app
-        .add_plugins(MinimalPlugins)
-        .add_message::<Event>()
-        .insert_resource(SkipReshuffle(false))
-        .insert_resource(MissionControlActive(false))
-        .insert_resource(FocusFollowsMouse(None))
         .insert_resource(Config::default())
-        .insert_resource(Initializing)
-        .add_plugins(MouseEventsPlugin)
-        .add_plugins(ScrollEventsPlugin)
-        .add_plugins(WorkspaceEventsPlugin)
-        .add_plugins(LayoutEventsPlugin)
-        .add_plugins(OverviewPlugin)
-        .add_plugins(FocusEventsPlugin)
-        .add_plugins(DisplayEventsPlugin)
-        .add_plugins((register_triggers, register_systems, register_commands));
-
-    bevy_app.insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));
+        .insert_resource(TimeUpdateStrategy::ManualDuration(FRAME));
 
     bevy_app
 }
@@ -366,4 +353,21 @@ macro_rules! assert_not_on_workspace {
             $window_id, $workspace_id
         );
     }};
+}
+
+#[test]
+#[should_panic(expected = "never ran")]
+fn run_fails_when_a_check_never_runs() {
+    use crate::commands::Command;
+
+    TestHarness::new()
+        .on_iteration(5, |_world, _state| {})
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
 }
