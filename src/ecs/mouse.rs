@@ -16,7 +16,7 @@ use crate::ecs::overview::Overview;
 use crate::ecs::params::{GlobalState, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, RepositionMarker,
-    Scrolling, SpawnCommandsExt,
+    Scrolling, SpawnCommandsExt, UpdateSet,
 };
 use bevy::ecs::schedule::common_conditions::{not, on_message, resource_exists};
 
@@ -54,6 +54,7 @@ impl Plugin for MouseEventsPlugin {
                 mouse_up_trigger,
                 horizontal_warp_mouse_trigger,
             )
+                .in_set(UpdateSet::Input)
                 .run_if(on_message::<InputEvent>)
                 // The overview owns the pointer while it is up: hovering a
                 // tile must not focus-follow the real window underneath.

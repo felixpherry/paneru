@@ -201,9 +201,10 @@ impl Plugin for FocusEventsPlugin {
         app.add_systems(
             Update,
             (
-                detect_focus_rejection.before(super::systems::timeout_ticker),
-                fix_window_size_on_focus.before(super::layout::layout_sizes_changed),
+                detect_focus_rejection.in_set(super::UpdateSet::Events),
+                fix_window_size_on_focus.in_set(super::UpdateSet::Focus),
                 autocenter_window_on_focus
+                    .in_set(super::UpdateSet::Layout)
                     .after(super::layout::layout_strip_changed)
                     .before(super::layout::reshuffle_layout_strip),
             ),
@@ -211,11 +212,13 @@ impl Plugin for FocusEventsPlugin {
         app.add_systems(
             PostUpdate,
             (
-                clear_pending_focus_layout,
-                mouse_follows_focus.after(super::systems::animate_resize_entities),
-                recover_lost_focus.run_if(on_timer(Duration::from_millis(
-                    REFRESH_WINDOW_CHECK_FREQ_MS,
-                ))),
+                clear_pending_focus_layout.in_set(super::PostUpdateSet::Bookkeeping),
+                mouse_follows_focus.in_set(super::PostUpdateSet::Ui),
+                recover_lost_focus
+                    .in_set(super::PostUpdateSet::Bookkeeping)
+                    .run_if(on_timer(Duration::from_millis(
+                        REFRESH_WINDOW_CHECK_FREQ_MS,
+                    ))),
             ),
         );
         app.add_observer(dim_remove_window_trigger)
@@ -460,16 +463,6 @@ fn autocenter_window_on_focus(
     }
     if active_display.active_strip().tabbed(entity) {
         return;
-    }
-    if ctx.config.auto_center()
-        && let Some((_, _, None)) = ctx.windows.get_managed(entity)
-        && let Some(frame) = ctx.windows.moving_frame(entity)
-    {
-        let size = frame.size();
-        let mut origin = frame.min;
-        let center = active_display.bounds().center();
-        origin.x = center.x - size.x / 2;
-        ctx.commands.reposition_entity(entity, origin);
     }
     ctx.commands.reshuffle_around(entity);
 }

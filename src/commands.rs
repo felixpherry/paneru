@@ -64,12 +64,13 @@ pub fn register_commands(app: &mut bevy::app::App) {
         .add_systems(
             PreUpdate,
             crate::menubar::menu_bar_command_handler
-                .run_if(on_message::<Event>)
-                .after(crate::ecs::systems::pump_events),
+                .in_set(crate::ecs::PreUpdateSet::Dispatch)
+                .run_if(on_message::<Event>),
         )
         .add_systems(
             PostUpdate,
             crate::menubar::save_menu_bar_preference
+                .in_set(crate::ecs::PostUpdateSet::Bookkeeping)
                 .run_if(resource_changed::<crate::menubar::MenuBarVisibility>),
         );
     // Registered here (not with the Lua systems) so it's exercised by the mock
@@ -77,7 +78,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
     #[cfg(feature = "lua")]
     app.add_systems(
         PreUpdate,
-        crate::ecs::layout_ops::apply_layout_ops.after(crate::ecs::systems::pump_events),
+        crate::ecs::layout_ops::apply_layout_ops.in_set(crate::ecs::PreUpdateSet::Dispatch),
     );
 
     query::register_query_commands(app);
@@ -86,7 +87,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
     app.init_resource::<crate::ecs::script_state::ScriptStateStore>();
     app.add_systems(
         PreUpdate,
-        crate::ecs::script_state::script_state_handler.after(crate::ecs::systems::pump_events),
+        crate::ecs::script_state::script_state_handler.in_set(crate::ecs::PreUpdateSet::Dispatch),
     );
     app.add_systems(
         PreUpdate,
@@ -112,7 +113,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_swap_focus,
             snap_window,
         )
-            .after(crate::ecs::systems::pump_events),
+            .in_set(crate::ecs::PreUpdateSet::Dispatch),
     );
     // A separate registration because the tuple above is already at Bevy's
     // 20-system limit.
@@ -127,7 +128,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             close_window,
             toggle_tabbed_display_handler,
         )
-            .after(crate::ecs::systems::pump_events),
+            .in_set(crate::ecs::PreUpdateSet::Dispatch),
     );
 }
 
@@ -826,13 +827,6 @@ fn resize_window(
     let new_width = round_px(next_ratio * f64::from(viewport.width()));
     let size = Size::new(new_width, frame.height());
 
-    let origin = clamp_origin_to_viewport(
-        IRect::from_center_size(frame.center(), size).min,
-        size,
-        viewport,
-    );
-    commands.reposition_entity(entity, origin);
-
     // Resize all windows in the column so stacked siblings share the new width.
     let strip = active_display.active_strip();
     if let Some(Column::Stack(stack)) = strip
@@ -1008,7 +1002,6 @@ fn full_width_window(
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(FullWidthMarker { width_ratio });
         }
-        commands.reposition_entity(entity, Origin::new(viewport.min.x, viewport.min.y));
         commands.resize_entity(entity, Size::new(viewport.width(), viewport.height()));
         commands.reshuffle_around(entity);
     }
