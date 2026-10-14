@@ -8,13 +8,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Match the local toolchain so a newer clippy can't fail CI with lints
+  # nobody sees locally. Bump together with the local Rust.
+  RUSTUP_TOOLCHAIN: "1.98.1"
 
 jobs:
   build:
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v4
-    - run: rustup update
+    - run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
     - run: cargo fmt --check
     - run: cargo clippy --all-targets -- -D warnings
     - run: cargo test --all-targets
