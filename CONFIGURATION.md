@@ -358,6 +358,8 @@ scrim_color = [0.05, 0.05, 0.07] # dim colour; the backdrop if there's no wallpa
 zoom = 0.5                     # size of each workspace row relative to the screen (0.1 - 0.75)
 row_gap = 24                   # points between workspace rows
 thumbnails = true              # live window content in tiles (see below)
+shortcuts = true               # number badges on tiles; type one to jump to it
+shortcut_keys = "1234567890"   # badge keys, favourite first (letters and digits)
 ```
 
 **Thumbnails** show each window's live content: only tiles on screen stream, at

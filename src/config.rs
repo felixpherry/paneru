@@ -750,6 +750,42 @@ impl Config {
         self.overview().thumbnails.unwrap_or(true)
     }
 
+    /// The overview's badge keys with their key codes, favourite first. Empty
+    /// means badges are off: switched off, or fewer than two usable keys.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired in by overview shortcuts Phase 2")
+    )]
+    pub fn overview_shortcut_keys(&self) -> Vec<(char, u8)> {
+        let overview = self.overview();
+        if !overview.shortcuts.unwrap_or(true) {
+            return Vec::new();
+        }
+        let mut keys: Vec<(char, u8)> = Vec::new();
+        for c in overview
+            .shortcut_keys
+            .as_deref()
+            .unwrap_or("1234567890")
+            .chars()
+        {
+            let c = c.to_ascii_lowercase();
+            if keys.iter().any(|(key, _)| *key == c) {
+                continue;
+            }
+            // ponytail: ANSI key positions; resolve through the TIS virtual keymap if a non-US layout needs it
+            if let Some(code) = keycode_for_key_name(&c.to_string(), &[]) {
+                keys.push((c, code));
+            } else {
+                warn!("overview: shortcut key '{c}' is not a letter or digit, skipped");
+            }
+        }
+        if keys.len() < 2 {
+            warn!("overview: fewer than two usable shortcut_keys, badges are off");
+            return Vec::new();
+        }
+        keys
+    }
+
     pub fn swipe_scroll_modifier(&self) -> Modifiers {
         let config = self.inner();
         config
@@ -1246,6 +1282,19 @@ pub struct OverviewOptions {
     pub zoom: Option<f64>,
     /// Master switch for window thumbnails (needs Screen Recording).
     pub thumbnails: Option<bool>,
+    /// Number badges on tiles; typing one jumps to that window. Defaults to on.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired in by overview shortcuts Phase 2")
+    )]
+    pub shortcuts: Option<bool>,
+    /// Badge keys, favourite first: letters and digits at their US key
+    /// positions. Defaults to `"1234567890"`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired in by overview shortcuts Phase 2")
+    )]
+    pub shortcut_keys: Option<String>,
 }
 
 /// `MainOptions` represents the primary configuration options for the window manager.
@@ -2748,6 +2797,13 @@ animation_speed = 12.0
     assert_eq!(config.overview_row_gap(), 24);
     assert_eq!(config.overview_zoom(), 0.5);
     assert!(config.overview_thumbnails());
+    let keys = config.overview_shortcut_keys();
+    assert_eq!(
+        keys.iter().map(|(c, _)| *c).collect::<String>(),
+        "1234567890"
+    );
+    assert_eq!(keys.first(), Some(&('1', 0x12)));
+    assert_eq!(keys.last(), Some(&('0', 0x1d)));
 }
 
 #[test]
@@ -2765,6 +2821,7 @@ scrim_color = [0.1, 0.2, 0.3]
 row_gap = 8
 zoom = 0.3
 thumbnails = false
+shortcut_keys = 'asdf'
 
 [bindings]
 ",
@@ -2777,6 +2834,10 @@ thumbnails = false
     assert_eq!(config.overview_row_gap(), 8);
     assert_eq!(config.overview_zoom(), 0.3);
     assert!(!config.overview_thumbnails());
+    assert_eq!(
+        config.overview_shortcut_keys(),
+        vec![('a', 0x00), ('s', 0x01), ('d', 0x02), ('f', 0x03)]
+    );
 }
 
 #[test]
@@ -2791,6 +2852,24 @@ fn test_overview_zoom_is_clamped() {
     assert_eq!(zoom("zoom = 0.01"), 0.1);
     assert_eq!(zoom("zoom = 2.0"), 0.75);
     assert_eq!(zoom(""), 0.5);
+}
+
+#[test]
+fn test_overview_shortcut_keys_edge_cases() {
+    let keys = |overview: &str| -> String {
+        Config::try_from(format!("[options]\n\n[overview]\n{overview}\n\n[bindings]\n").as_str())
+            .expect("config should parse")
+            .overview_shortcut_keys()
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect()
+    };
+
+    assert_eq!(keys("shortcuts = false"), "");
+    assert_eq!(keys("shortcut_keys = '1'"), "");
+    assert_eq!(keys("shortcut_keys = '1!2'"), "12");
+    assert_eq!(keys("shortcut_keys = '1122'"), "12");
+    assert_eq!(keys("shortcut_keys = 'AB'"), "ab");
 }
 
 #[test]
