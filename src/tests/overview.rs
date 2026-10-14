@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::overview::{
     KeyAction, Overview, OverviewConfig, OverviewLayout, OverviewPhase, OverviewRow, OverviewTile,
-    key_action, project, step_progress, tile_at,
+    Shortcuts, key_action, project, shortcut_labels, shortcut_order, step_progress, tile_at,
 };
 use crate::ecs::params::{ActiveDisplay, FrameActivity};
 use crate::ecs::workspace::PreviousStripPosition;
@@ -602,6 +602,7 @@ fn test_overview_mid_frame_only_while_animating() {
                 display: 0,
                 reproject: false,
                 centres: HashMap::new(),
+                shortcuts: Shortcuts::default(),
             });
         }
         let mut state = SystemState::<FrameActivity>::new(&mut world);
@@ -658,6 +659,213 @@ fn test_overview_key_action_maps_bare_keys_only() {
         Some(KeyAction::Move(Direction::West)),
         "arrows can carry Fn"
     );
+}
+
+// ── Shortcuts (pure) ───────────────────────────────────────────────────────
+
+/// Badge keys whose key code is their ASCII byte, so `press(b'1')` types `1`.
+fn ascii_keys(chars: &str) -> Vec<(char, u8)> {
+    chars
+        .chars()
+        .map(|c| (c, u8::try_from(c).expect("ascii")))
+        .collect()
+}
+
+/// Each of `wins` with its badge, `None` when unlabelled.
+fn labels_of<'a>(shortcuts: &'a Shortcuts, wins: &[Entity]) -> Vec<Option<&'a str>> {
+    wins.iter()
+        .map(|entity| shortcuts.badges.get(entity).map(String::as_str))
+        .collect()
+}
+
+const DIGITS: &str = "1234567890";
+
+#[test]
+fn test_overview_shortcut_labels() {
+    let keys = DIGITS.chars().collect::<Vec<_>>();
+    let labels = |count| shortcut_labels(count, &keys).join(" ");
+
+    assert_eq!(labels(3), "1 2 3");
+    assert_eq!(labels(10), "1 2 3 4 5 6 7 8 9 0");
+    assert_eq!(labels(11), "1 2 3 4 5 6 7 8 9 01 02");
+    assert_eq!(
+        labels(20),
+        "1 2 3 4 5 6 7 8 9 01 02 03 04 05 06 07 08 09 001 002"
+    );
+    assert!(shortcut_labels(5, &['1']).is_empty(), "one key gives none");
+}
+
+#[test]
+fn test_overview_shortcut_order() {
+    let screen = IRect::new(0, 0, 1000, 600);
+    let ids = entities(9);
+    let [above, top, bottom, left, below, off] = [ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]];
+    let tile = |entity, x, y| {
+        let frame = IRect::new(x, y, x + 100, y + 50);
+        OverviewTile {
+            entity,
+            target: frame,
+            origin: frame,
+            from: None,
+            tab_count: 1,
+        }
+    };
+    let row = |strip, virtual_index, is_active, tiles| OverviewRow {
+        strip,
+        virtual_index,
+        is_active,
+        band: screen,
+        tiles,
+    };
+    let layout = OverviewLayout {
+        rows: vec![
+            row(ids[6], 0, false, vec![tile(above, 500, 0)]),
+            // `bottom` is listed before `top` but sits below it in the same column.
+            row(
+                ids[7],
+                1,
+                true,
+                vec![
+                    tile(bottom, 300, 300),
+                    tile(top, 300, 200),
+                    tile(left, 100, 200),
+                ],
+            ),
+            row(
+                ids[8],
+                2,
+                false,
+                vec![tile(below, 0, 450), tile(off, 1200, 450)],
+            ),
+        ],
+    };
+
+    assert_eq!(
+        shortcut_order(&layout, screen),
+        [left, top, bottom, above, below],
+        "active row first, then the row above before the row below; `off` excluded"
+    );
+}
+
+#[test]
+fn test_overview_shortcuts_assign_keeps_labels() {
+    let wins = entities(4);
+    let [a, b, c, d] = [wins[0], wins[1], wins[2], wins[3]];
+    let mut shortcuts = Shortcuts::new(ascii_keys(DIGITS));
+
+    shortcuts.assign(&[a, b, c]);
+    assert_eq!(
+        labels_of(&shortcuts, &[a, b, c]),
+        [Some("1"), Some("2"), Some("3")]
+    );
+
+    shortcuts.typed = "1".to_string();
+    shortcuts.assign(&[a, c, d]);
+    assert_eq!(
+        labels_of(&shortcuts, &wins),
+        [Some("1"), None, Some("3"), Some("4")],
+        "`b` left the screen but keeps `2` reserved; `d` takes the next free label"
+    );
+    assert!(shortcuts.typed.is_empty(), "assign clears typed keys");
+
+    let mut off = Shortcuts::new(Vec::new());
+    off.assign(&wins);
+    assert!(off.badges.is_empty(), "no keys, no badges");
+}
+
+#[test]
+fn test_overview_shortcuts_assign_grows_to_two_key_labels() {
+    let wins = entities(11);
+    let mut shortcuts = Shortcuts::new(ascii_keys(DIGITS));
+
+    shortcuts.assign(&wins[..10]);
+    assert_eq!(shortcuts.badges[&wins[9]], "0");
+
+    shortcuts.assign(&wins);
+    let labels = labels_of(&shortcuts, &wins)
+        .into_iter()
+        .map(|label| label.expect("every tile labelled"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        labels.join(" "),
+        "1 2 3 4 5 6 7 8 9 01 02",
+        "`0` becomes a prefix: its holder moves to `01`, the new tile gets `02`"
+    );
+}
+
+/// Eleven tiles labelled `1..9 01 02`.
+fn eleven_labelled() -> (Shortcuts, Vec<Entity>) {
+    let wins = entities(11);
+    let mut shortcuts = Shortcuts::new(ascii_keys(DIGITS));
+    shortcuts.assign(&wins);
+    (shortcuts, wins)
+}
+
+#[test]
+fn test_overview_shortcuts_press() {
+    let (mut shortcuts, wins) = eleven_labelled();
+
+    assert_eq!(shortcuts.press(b'1'), Some(wins[0]), "single-key jump");
+
+    assert_eq!(shortcuts.press(b'0'), None);
+    assert_eq!(shortcuts.typed, "0", "`0` is a prefix, so it waits");
+    assert_eq!(shortcuts.press(b'1'), Some(wins[9]), "two-key jump to `01`");
+    assert!(shortcuts.typed.is_empty());
+
+    assert_eq!(shortcuts.press(b'0'), None);
+    assert_eq!(
+        shortcuts.press(b'5'),
+        Some(wins[4]),
+        "`05` leads nowhere, so it restarts from `5`"
+    );
+    assert!(shortcuts.typed.is_empty());
+
+    assert_eq!(shortcuts.press(b'0'), None);
+    assert_eq!(shortcuts.press(b'x'), None, "not a badge key");
+    assert_eq!(shortcuts.typed, "0", "a non-badge key leaves typed alone");
+}
+
+#[test]
+fn test_overview_shortcuts_backspace_and_clear() {
+    let (mut shortcuts, _) = eleven_labelled();
+
+    shortcuts.press(b'0');
+    assert!(shortcuts.backspace());
+    assert!(shortcuts.typed.is_empty());
+    assert!(!shortcuts.backspace(), "nothing left to remove");
+
+    shortcuts.press(b'0');
+    assert!(shortcuts.clear());
+    assert!(shortcuts.typed.is_empty());
+    assert!(!shortcuts.clear(), "nothing left to clear");
+}
+
+#[test]
+fn test_overview_open_labels_on_screen_tiles() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |world, _state| {
+            let overview = world.get_resource::<Overview>().expect("overview open");
+            let mut tiles = overview
+                .layout
+                .rows
+                .iter()
+                .flat_map(|row| &row.tiles)
+                .collect::<Vec<_>>();
+            tiles.sort_by_key(|tile| tile.target.min.x);
+            let labels = tiles
+                .iter()
+                .map(|tile| {
+                    overview
+                        .shortcuts
+                        .badges
+                        .get(&tile.entity)
+                        .map(String::as_str)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(labels, [Some("1"), Some("2"), Some("3")]);
+        })
+        .run(vec![toggle()]);
 }
 
 // ── Live focus (harness) ───────────────────────────────────────────────────

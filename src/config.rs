@@ -752,10 +752,6 @@ impl Config {
 
     /// The overview's badge keys with their key codes, favourite first. Empty
     /// means badges are off: switched off, or fewer than two usable keys.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired in by overview shortcuts Phase 2")
-    )]
     pub fn overview_shortcut_keys(&self) -> Vec<(char, u8)> {
         let overview = self.overview();
         if !overview.shortcuts.unwrap_or(true) {
@@ -1283,17 +1279,9 @@ pub struct OverviewOptions {
     /// Master switch for window thumbnails (needs Screen Recording).
     pub thumbnails: Option<bool>,
     /// Number badges on tiles; typing one jumps to that window. Defaults to on.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired in by overview shortcuts Phase 2")
-    )]
     pub shortcuts: Option<bool>,
     /// Badge keys, favourite first: letters and digits at their US key
     /// positions. Defaults to `"1234567890"`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired in by overview shortcuts Phase 2")
-    )]
     pub shortcut_keys: Option<String>,
 }
 

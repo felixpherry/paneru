@@ -8,7 +8,7 @@
 //! The `Overview` resource exists exactly while the overview is on screen, and
 //! every system here is gated on it so nothing is scheduled while it is shut.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use bevy::app::{App, Plugin, PostUpdate, PreUpdate};
 use bevy::ecs::change_detection::DetectChanges;
@@ -113,10 +113,12 @@ pub struct Overview {
     /// Each row's centre window (row strip → window), so a row keeps its place
     /// while neither its focus nor its remembered focus is known.
     pub centres: HashMap<Entity, Entity>,
+    /// Badge labels and typed keys, reset by every open.
+    pub shortcuts: Shortcuts,
 }
 
 impl Overview {
-    fn opening(display: CGDirectDisplayID) -> Self {
+    fn opening(display: CGDirectDisplayID, keys: Vec<(char, u8)>) -> Self {
         Self {
             phase: OverviewPhase::Opening,
             progress: 0.0,
@@ -126,6 +128,7 @@ impl Overview {
             display,
             reproject: false,
             centres: HashMap::new(),
+            shortcuts: Shortcuts::new(keys),
         }
     }
 
@@ -370,6 +373,162 @@ pub fn step_progress(progress: f32, goal: f32, t: f32) -> f32 {
     }
 }
 
+/// Umbriel's prefix-free labels: single keys first, favourite first; while there
+/// are fewer labels than `count`, the last label becomes a prefix for one label
+/// per key. Fewer than two keys gives none.
+pub fn shortcut_labels(count: usize, keys: &[char]) -> Vec<String> {
+    if keys.len() < 2 {
+        return Vec::new();
+    }
+    let mut labels = keys.iter().map(char::to_string).collect::<VecDeque<_>>();
+    while labels.len() < count {
+        let Some(prefix) = labels.pop_back() else {
+            break;
+        };
+        labels.extend(keys.iter().map(|key| format!("{prefix}{key}")));
+    }
+    labels.into_iter().take(count).collect()
+}
+
+/// The tiles that get labels, in label order: rows nearest the active row first
+/// (a tie goes to the row above), each row left to right then top to bottom.
+/// Only tiles whose settled frame (`target`) overlaps `screen`.
+pub fn shortcut_order(layout: &OverviewLayout, screen: IRect) -> Vec<Entity> {
+    let active = layout
+        .rows
+        .iter()
+        .position(|row| row.is_active)
+        .unwrap_or(0);
+    let mut rows = layout.rows.iter().enumerate().collect::<Vec<_>>();
+    rows.sort_by_key(|(index, _)| (index.abs_diff(active), *index));
+    rows.into_iter()
+        .flat_map(|(_, row)| {
+            let mut tiles = row
+                .tiles
+                .iter()
+                .filter(|tile| !tile.target.intersect(screen).is_empty())
+                .collect::<Vec<_>>();
+            tiles.sort_by_key(|tile| (tile.target.min.x, tile.target.min.y));
+            tiles.into_iter().map(|tile| tile.entity)
+        })
+        .collect()
+}
+
+/// Badge labels for the open overview, and the keys typed towards one.
+#[derive(Debug, Default)]
+pub struct Shortcuts {
+    /// Badge keys with their key codes, favourite first; empty when badges are off.
+    keys: Vec<(char, u8)>,
+    /// Every tile labelled since the open, in first-seen order. Kept for tiles
+    /// that left the screen, so their label stays reserved until close.
+    assigned: Vec<(Entity, String)>,
+    /// Labels of the tiles on screen now.
+    pub badges: HashMap<Entity, String>,
+    /// Keys typed towards a label so far.
+    pub typed: String,
+}
+
+impl Shortcuts {
+    pub fn new(keys: Vec<(char, u8)>) -> Self {
+        Self {
+            keys,
+            ..Self::default()
+        }
+    }
+
+    /// Labels `eligible` (in label order), keeping every label already handed
+    /// out. Umbriel's `updateShortcutAssignments`.
+    pub fn assign(&mut self, eligible: &[Entity]) {
+        self.typed.clear();
+        if self.keys.is_empty() {
+            self.badges.clear();
+            return;
+        }
+        for &entity in eligible {
+            if !self.assigned.iter().any(|(seen, _)| *seen == entity) {
+                self.assigned.push((entity, String::new()));
+            }
+        }
+        let keys = self.keys.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let labels = shortcut_labels(self.assigned.len(), &keys);
+        // A label that became a prefix (`0` once `01` exists) is handed out again.
+        for (_, label) in &mut self.assigned {
+            if !labels.contains(label) {
+                label.clear();
+            }
+        }
+        let mut free = labels
+            .into_iter()
+            .filter(|label| !self.assigned.iter().any(|(_, held)| held == label))
+            .collect::<Vec<_>>()
+            .into_iter();
+        for (_, label) in &mut self.assigned {
+            if label.is_empty() {
+                *label = free.next().unwrap_or_default();
+            }
+        }
+        self.badges = eligible
+            .iter()
+            .filter_map(|entity| {
+                let (_, label) = self.assigned.iter().find(|(seen, _)| seen == entity)?;
+                Some((*entity, label.clone()))
+            })
+            .collect();
+    }
+
+    /// Types the key with `keycode`; the tile to jump to once a label is
+    /// complete. Umbriel's `handleShortcutKey`: a key that leads nowhere
+    /// restarts from itself.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired in by overview shortcuts Phase 3")
+    )]
+    pub fn press(&mut self, keycode: u8) -> Option<Entity> {
+        let (key, _) = *self.keys.iter().find(|(_, code)| *code == keycode)?;
+        let mut candidate = self.typed.clone();
+        candidate.push(key);
+        loop {
+            if let Some((&entity, _)) = self.badges.iter().find(|(_, label)| **label == candidate) {
+                self.typed.clear();
+                return Some(entity);
+            }
+            if self
+                .badges
+                .values()
+                .any(|label| label.starts_with(&candidate))
+            {
+                self.typed = candidate;
+                return None;
+            }
+            if self.typed.is_empty() {
+                return None;
+            }
+            self.typed.clear();
+            candidate = key.to_string();
+        }
+    }
+
+    /// Removes the last typed key; whether there was one.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired in by overview shortcuts Phase 3")
+    )]
+    pub fn backspace(&mut self) -> bool {
+        self.typed.pop().is_some()
+    }
+
+    /// Clears the typed keys; whether there were any.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired in by overview shortcuts Phase 3")
+    )]
+    pub fn clear(&mut self) -> bool {
+        let typed = !self.typed.is_empty();
+        self.typed.clear();
+        typed
+    }
+}
+
 pub struct OverviewPlugin;
 
 impl Plugin for OverviewPlugin {
@@ -401,6 +560,7 @@ fn overview_toggle(
     mut messages: MessageReader<Event>,
     overview: Option<ResMut<Overview>>,
     mission_control: Res<MissionControlActive>,
+    config: Res<Config>,
     // A plain query, not `ActiveDisplay`: that one's `Single` would unschedule
     // this system whenever no display is active, and then nothing could close.
     displays: Query<&Display, With<ActiveDisplayMarker>>,
@@ -425,7 +585,10 @@ fn overview_toggle(
     {
         // Mission Control already shows every window, and suppresses overlays;
         // an overview on top of it would be drawn over the wrong layout.
-        commands.insert_resource(Overview::opening(display.id()));
+        commands.insert_resource(Overview::opening(
+            display.id(),
+            config.overview_shortcut_keys(),
+        ));
         set_overview_active(true);
     }
 }
@@ -607,6 +770,11 @@ fn overview_project(
     {
         overview.hovered = None;
     }
+    // The whole screen, menu bar included, as `overview_render` draws it.
+    let display = active_display.display();
+    let mut screen = display.bounds();
+    screen.min.y -= display.menubar_height();
+    overview.shortcuts.assign(&shortcut_order(&layout, screen));
     overview.layout = layout;
 }
 
