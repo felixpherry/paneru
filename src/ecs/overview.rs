@@ -42,7 +42,8 @@ use crate::overlay::{OverviewRenderer, OverviewScene, SceneTile};
 use crate::platform::Modifiers;
 use crate::platform::input::set_overview_active;
 
-/// Escape. Always closes, so a swallowed keyboard can never get stuck.
+/// Escape. Closes, once any half-typed label is cleared, so a swallowed
+/// keyboard can never get stuck.
 const KEY_ESCAPE: u8 = 53;
 const KEY_RETURN: u8 = 36;
 const KEY_KEYPAD_ENTER: u8 = 76;
@@ -50,6 +51,7 @@ const KEY_LEFT: u8 = 123;
 const KEY_RIGHT: u8 = 124;
 const KEY_DOWN: u8 = 125;
 const KEY_UP: u8 = 126;
+const KEY_BACKSPACE: u8 = 51;
 
 /// What a key does while the overview is open.
 #[derive(Debug, PartialEq)]
@@ -91,9 +93,8 @@ pub enum OverviewPhase {
     Opening,
     /// Settled and static.
     Open,
-    /// Zooming back in, `progress` falling towards 0. Carries the window to
-    /// activate once the animation finishes, if any.
-    Closing { activate: Option<Entity> },
+    /// Zooming back in, `progress` falling towards 0.
+    Closing,
 }
 
 #[derive(Debug, Resource)]
@@ -132,13 +133,13 @@ impl Overview {
         }
     }
 
-    /// Starts the close, activating `activate` once it finishes. A no-op once
-    /// already closing, so the first close path to fire wins.
-    fn close(&mut self, activate: Option<Entity>) {
-        if matches!(self.phase, OverviewPhase::Closing { .. }) {
+    /// Starts the close. A no-op once already closing, so the first close path
+    /// to fire wins.
+    fn close(&mut self) {
+        if self.phase == OverviewPhase::Closing {
             return;
         }
-        self.phase = OverviewPhase::Closing { activate };
+        self.phase = OverviewPhase::Closing;
         // Tiles must zoom back to where the windows are now, not where they
         // were at the last projection.
         self.reproject = true;
@@ -479,10 +480,6 @@ impl Shortcuts {
     /// Types the key with `keycode`; the tile to jump to once a label is
     /// complete. Umbriel's `handleShortcutKey`: a key that leads nowhere
     /// restarts from itself.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired in by overview shortcuts Phase 3")
-    )]
     pub fn press(&mut self, keycode: u8) -> Option<Entity> {
         let (key, _) = *self.keys.iter().find(|(_, code)| *code == keycode)?;
         let mut candidate = self.typed.clone();
@@ -509,19 +506,11 @@ impl Shortcuts {
     }
 
     /// Removes the last typed key; whether there was one.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired in by overview shortcuts Phase 3")
-    )]
     pub fn backspace(&mut self) -> bool {
         self.typed.pop().is_some()
     }
 
     /// Clears the typed keys; whether there were any.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired in by overview shortcuts Phase 3")
-    )]
     pub fn clear(&mut self) -> bool {
         let typed = !self.typed.is_empty();
         self.typed.clear();
@@ -579,7 +568,7 @@ fn overview_toggle(
     }
 
     if let Some(mut overview) = overview {
-        overview.close(None);
+        overview.close();
     } else if !mission_control.0
         && let Ok(display) = displays.single()
     {
@@ -595,7 +584,8 @@ fn overview_toggle(
 
 /// Keyboard and mouse input while the overview is open. A move is a real focus
 /// command, run on the live layout behind the overview, which re-projects to
-/// follow it. Closing leaves focus where it is; a click closes onto its tile.
+/// follow it. The close keys leave focus where it is. A click or a typed badge
+/// focuses its tile first, then closes onto it.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn overview_input(
     mut messages: MessageReader<Event>,
@@ -606,17 +596,30 @@ fn overview_input(
 ) {
     // It only ever shows the display it opened on.
     if mission_control.0 || displays.single().map(Display::id).ok() != Some(overview.display) {
-        overview.close(None);
+        overview.close();
     }
     for event in messages.read() {
-        if matches!(overview.phase, OverviewPhase::Closing { .. }) {
+        if overview.phase == OverviewPhase::Closing {
             return;
         }
         match event {
             Event::OverviewKey { keycode, modifiers } => {
                 match key_action(*keycode, *modifiers) {
-                    Some(KeyAction::Close) => overview.close(None),
+                    // A half-typed label takes the first Escape; the next one
+                    // closes. Read before clearing, so an Escape with nothing
+                    // typed doesn't mark the overview changed.
+                    Some(KeyAction::Close)
+                        if *keycode == KEY_ESCAPE && !overview.shortcuts.typed.is_empty() =>
+                    {
+                        overview.shortcuts.clear();
+                    }
+                    Some(KeyAction::Close) => overview.close(),
                     Some(KeyAction::Move(direction)) => {
+                        // Checked first, so a plain move doesn't mark the
+                        // overview changed.
+                        if !overview.shortcuts.typed.is_empty() {
+                            overview.shortcuts.clear();
+                        }
                         // Rows are workspaces: up and down leave a stack for
                         // the workspace above or below.
                         let operation = match direction {
@@ -629,11 +632,23 @@ fn overview_input(
                             command: Command::Window(operation),
                         }));
                     }
-                    None => {}
+                    // Badge keys are bare: Shift+1 is not 1.
+                    None if modifiers.intersects(CHORD_MODIFIERS | Modifiers::SHIFT) => {}
+                    None if *keycode == KEY_BACKSPACE => {
+                        if !overview.shortcuts.typed.is_empty() {
+                            overview.shortcuts.backspace();
+                        }
+                    }
+                    None => {
+                        if let Some(target) = overview.shortcuts.press(*keycode) {
+                            activate(&mut commands, &overview.layout, target);
+                            overview.close();
+                        }
+                    }
                 }
             }
-            // A click activates the tile under it; a click anywhere else
-            // closes, like clicking outside a menu.
+            // A click focuses the tile under it, then closes onto it; a click
+            // anywhere else just closes, like clicking outside a menu.
             Event::MouseDown { point, .. } => {
                 let hit = tile_at(
                     &overview.layout,
@@ -641,7 +656,10 @@ fn overview_input(
                     overview.slide,
                     cg_point(*point),
                 );
-                overview.close(hit);
+                if let Some(hit) = hit {
+                    activate(&mut commands, &overview.layout, hit);
+                }
+                overview.close();
             }
             Event::MouseMoved { point, .. } => {
                 let hit = tile_at(
@@ -855,7 +873,7 @@ fn overview_animate(
     let goal = match overview.phase {
         OverviewPhase::Open => return,
         OverviewPhase::Opening => 1.0,
-        OverviewPhase::Closing { .. } => 0.0,
+        OverviewPhase::Closing => 0.0,
     };
     overview.progress = step_progress(overview.progress, goal, t);
 
@@ -863,50 +881,34 @@ fn overview_animate(
         OverviewPhase::Opening if overview.progress >= 1.0 => {
             overview.phase = OverviewPhase::Open;
         }
-        OverviewPhase::Closing { activate } if overview.progress <= 0.0 => {
-            let activation = activate.and_then(|target| {
-                let (row, _) = overview.layout.find(target)?;
-                let row = &overview.layout.rows[row];
-                Some(Activation {
-                    target,
-                    strip: row.strip,
-                    row_is_active: row.is_active,
-                })
-            });
-            finish_close(&mut commands, renderer, activation);
+        OverviewPhase::Closing if overview.progress <= 0.0 => {
+            finish_close(&mut commands, renderer);
         }
         _ => {}
     }
 }
 
-/// The window a closing overview commits to, and the row it lives in.
-struct Activation {
-    target: Entity,
-    strip: Entity,
-    row_is_active: bool,
+/// Focuses `target` now, switching to its row first if that row isn't shown.
+/// The close that follows reprojects, so its zoom lands on `target`.
+fn activate(commands: &mut Commands, layout: &OverviewLayout, target: Entity) {
+    let Some((row, _)) = layout.find(target) else {
+        return;
+    };
+    let row = &layout.rows[row];
+    // `show_active_workspace` parks the old row and unparks this one.
+    if !row.is_active
+        && let Ok(mut entity_commands) = commands.get_entity(row.strip)
+    {
+        entity_commands.try_insert(ActiveWorkspaceMarker);
+    }
+    commands.focus_entity(target, true);
+    commands.ensure_visible(target);
 }
 
-/// The single exit from the overview: applies the pending activation, gives the
-/// keyboard back, takes the window down and drops the resource, which also
-/// unschedules every overview system.
-fn finish_close(
-    commands: &mut Commands,
-    renderer: Option<NonSendMut<OverviewRenderer>>,
-    activation: Option<Activation>,
-) {
-    if let Some(Activation {
-        target,
-        strip,
-        row_is_active,
-    }) = activation
-    {
-        // `show_active_workspace` parks the old row and unparks this one.
-        if !row_is_active && let Ok(mut entity_commands) = commands.get_entity(strip) {
-            entity_commands.try_insert(ActiveWorkspaceMarker);
-        }
-        commands.focus_entity(target, true);
-        commands.ensure_visible(target);
-    }
+/// The single exit from the overview: gives the keyboard back, takes the
+/// window down and drops the resource, which also unschedules every overview
+/// system.
+fn finish_close(commands: &mut Commands, renderer: Option<NonSendMut<OverviewRenderer>>) {
     set_overview_active(false);
     if let Some(mut renderer) = renderer {
         renderer.close();

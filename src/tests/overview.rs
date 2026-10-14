@@ -22,7 +22,7 @@ use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SpawnWindowTrigger};
 use crate::events::Event;
 use crate::manager::{Display, Window};
-use crate::platform::Modifiers;
+use crate::platform::{Modifiers, WinID};
 
 use super::*;
 
@@ -614,10 +614,7 @@ fn test_overview_mid_frame_only_while_animating() {
 
     assert!(!mid_frame(None, 1.0));
     assert!(mid_frame(Some(OverviewPhase::Opening), 1.0));
-    assert!(mid_frame(
-        Some(OverviewPhase::Closing { activate: None }),
-        1.0
-    ));
+    assert!(mid_frame(Some(OverviewPhase::Closing), 1.0));
     assert!(
         !mid_frame(Some(OverviewPhase::Open), 1.0),
         "a settled overview idles"
@@ -1392,20 +1389,24 @@ fn test_overview_with_no_windows_opens_and_closes() {
         .run(vec![toggle(), key(KEY_RETURN)]);
 }
 
-#[test]
-fn test_overview_click_activates_tile_and_miss_closes() {
-    let tile_centre = |world: &mut World, id| {
-        let entity = find_window_entity(id, world);
-        let overview = world.get_resource::<Overview>().expect("overview open");
-        let (_, tile) = overview.layout.find(entity).expect("tile");
-        let centre = tile.target.center();
-        CGPoint::new(f64::from(centre.x), f64::from(centre.y))
-    };
-    let click = |point| Event::MouseDown {
+/// The centre of window `id`'s settled tile, in CG coordinates.
+fn tile_centre(world: &mut World, id: WinID) -> CGPoint {
+    let entity = find_window_entity(id, world);
+    let overview = world.get_resource::<Overview>().expect("overview open");
+    let (_, tile) = overview.layout.find(entity).expect("tile");
+    let centre = tile.target.center();
+    CGPoint::new(f64::from(centre.x), f64::from(centre.y))
+}
+
+fn click(point: CGPoint) -> Event {
+    Event::MouseDown {
         point,
         modifiers: Modifiers::empty(),
-    };
+    }
+}
 
+#[test]
+fn test_overview_click_activates_tile_and_miss_closes() {
     // Window 1's tile sits at a fixed spot once the overview has settled.
     let mut harness = TestHarness::new().with_windows(3);
     harness.run(vec![Event::MenuOpened { window_id: 0 }, toggle()]);
@@ -1424,6 +1425,37 @@ fn test_overview_click_activates_tile_and_miss_closes() {
             toggle(),
             click(CGPoint::new(-1000.0, -1000.0)),
         ]);
+}
+
+/// A click focuses its tile, switching row, before the zoom-in starts.
+#[test]
+fn test_overview_click_focuses_before_the_zoom_in() {
+    const SETTLE: Duration = Duration::from_secs(10);
+    let mut harness = TestHarness::new()
+        .with_config(overview_config("animation_speed = 1.0"))
+        .with_windows(3);
+    // Window 0 alone on VW1, the row below.
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        send_window_down(),
+        toggle(),
+    ]);
+    harness.advance(SETTLE);
+    let point = tile_centre(harness.world(), 0);
+    harness.run(vec![click(point)]);
+
+    let world = harness.world();
+    // Read and dropped before `active_virtual_index` borrows the world mutably.
+    let phase = world
+        .get_resource::<Overview>()
+        .map(|overview| overview.phase);
+    assert_eq!(phase, Some(OverviewPhase::Closing), "still zooming in");
+    assert_eq!(
+        active_virtual_index(world),
+        1,
+        "row switched before the zoom-in"
+    );
+    assert_focused!(world, 0);
 }
 
 #[test]
@@ -1451,6 +1483,181 @@ fn test_overview_refuses_to_open_during_mission_control() {
             Event::MissionControlExit,
             toggle(),
             Event::MissionControlShowAllWindows,
+        ]);
+}
+
+// ── Shortcuts (harness) ────────────────────────────────────────────────────
+
+/// A config with `table` under `[overview]`.
+fn overview_config(table: &str) -> Config {
+    Config::try_from(format!("[options]\n[bindings]\n[overview]\n{table}\n").as_str())
+        .expect("config parses")
+}
+
+/// ANSI key codes of the badge keys typed below.
+const KEY_1: u8 = 0x12;
+const KEY_2: u8 = 0x13;
+const KEY_3: u8 = 0x14;
+const KEY_BACKSPACE: u8 = 0x33;
+
+/// Window `id`'s badge, if it has one.
+fn badge(world: &mut World, id: WinID) -> Option<String> {
+    let entity = find_window_entity(id, world);
+    world
+        .resource::<Overview>()
+        .shortcuts
+        .badges
+        .get(&entity)
+        .cloned()
+}
+
+fn typed(world: &World) -> String {
+    world.resource::<Overview>().shortcuts.typed.clone()
+}
+
+/// Panics if the overview is closed or closing.
+fn assert_open(world: &World) {
+    let phase = world
+        .get_resource::<Overview>()
+        .map(|overview| overview.phase);
+    assert!(
+        phase.is_some_and(|phase| phase != OverviewPhase::Closing),
+        "overview open, got {phase:?}"
+    );
+}
+
+fn assert_closed(world: &World) {
+    assert!(
+        world.get_resource::<Overview>().is_none(),
+        "overview closed"
+    );
+}
+
+#[test]
+fn test_overview_typing_a_badge_jumps_to_its_window() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert_eq!(badge(world, 1).as_deref(), Some("2"));
+        })
+        .on_iteration(2, |world, _state| {
+            assert_closed(world);
+            assert_focused!(world, 1);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            toggle(),
+            key(KEY_2),
+        ]);
+}
+
+#[test]
+fn test_overview_escape_clears_a_half_typed_label_first() {
+    TestHarness::new()
+        .with_config(overview_config("shortcut_keys = \"12\""))
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            let badges = [0, 1, 2].map(|id| badge(world, id).unwrap_or_default());
+            assert_eq!(badges, ["1", "21", "22"]);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_open(world);
+            assert_eq!(typed(world), "2");
+        })
+        .on_iteration(3, |world, _state| {
+            assert_open(world);
+            assert_eq!(typed(world), "", "the first Escape clears");
+        })
+        .on_iteration(4, |world, _state| assert_closed(world))
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            toggle(),
+            key(KEY_2),
+            key(KEY_ESCAPE),
+            key(KEY_ESCAPE),
+        ]);
+}
+
+/// `2`, Backspace, `1` lands on `1` (window 0). Without the Backspace, `1`
+/// would complete `21` and focus window 1.
+#[test]
+fn test_overview_backspace_removes_the_last_typed_key() {
+    TestHarness::new()
+        .with_config(overview_config("shortcut_keys = \"12\""))
+        .with_windows(3)
+        .on_iteration(3, |world, _state| {
+            assert_open(world);
+            assert_eq!(typed(world), "");
+        })
+        .on_iteration(4, |world, _state| {
+            assert_closed(world);
+            assert_focused!(world, 0);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            toggle(),
+            key(KEY_2),
+            key(KEY_BACKSPACE),
+            key(KEY_1),
+        ]);
+}
+
+#[test]
+fn test_overview_arrow_clears_a_half_typed_label() {
+    TestHarness::new()
+        .with_config(overview_config("shortcut_keys = \"12\""))
+        .with_windows(3)
+        .on_iteration(3, |world, _state| {
+            assert_open(world);
+            assert_eq!(typed(world), "");
+            assert_focused!(world, 1);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            toggle(),
+            key(KEY_2),
+            key(KEY_RIGHT),
+        ]);
+}
+
+#[test]
+fn test_overview_shortcuts_off_ignores_number_keys() {
+    TestHarness::new()
+        .with_config(overview_config("shortcuts = false"))
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert!(world.resource::<Overview>().shortcuts.badges.is_empty());
+        })
+        .on_iteration(2, |world, _state| {
+            assert_open(world);
+            assert_focused!(world, 0);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            toggle(),
+            key(KEY_2),
+        ]);
+}
+
+/// VW0 holds windows 1 and 2; window 0 sits alone on VW1, the row below, and
+/// is labelled after them.
+#[test]
+fn test_overview_badge_jumps_to_another_row() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(2, |world, _state| {
+            assert_eq!(badge(world, 0).as_deref(), Some("3"));
+        })
+        .on_iteration(3, |world, _state| {
+            assert_closed(world);
+            assert_eq!(active_virtual_index(world), 1);
+            assert_focused!(world, 0);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            send_window_down(),
+            toggle(),
+            key(KEY_3),
         ]);
 }
 

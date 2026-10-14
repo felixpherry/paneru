@@ -47,8 +47,9 @@ pub fn set_focused_passthrough(keys: Vec<(u8, Modifiers)>) {
 
 /// Whether the overview is open. While set, the event tap routes keys through
 /// [`overview_route`]: bare overview keys become [`Event::OverviewKey`],
-/// bindings run as usual, other chords pass through and bare keys are
-/// swallowed.
+/// bindings run as usual, other chords pass through, and every other bare key
+/// goes to the overview too, which ignores what it doesn't use. No bare key
+/// reaches an application.
 static OVERVIEW_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Switch the event tap in or out of overview mode. Every close path must clear
@@ -686,9 +687,8 @@ impl InputHandler {
 
     /// Handles key press events. It determines the modifier mask and attempts to find a matching keybinding in the configuration.
     /// If a binding is found, it sends a `Command` event and intercepts the key press.
-    /// While the overview is open, [`overview_route`] decides instead: overview
-    /// keys and bindings are sent and consumed, unbound chords pass through, and
-    /// bare keys are consumed unsent.
+    /// While the overview is open, [`overview_route`] decides instead: bare
+    /// keys and bindings are sent and consumed, and unbound chords pass through.
     ///
     /// # Arguments
     ///
@@ -707,7 +707,7 @@ impl InputHandler {
 
         // Routed keys are consumed even if the send fails — a partially
         // swallowed keyboard is worse than a fully swallowed one, and Escape
-        // always closes.
+        // can always close.
         if OVERVIEW_ACTIVE.load(Ordering::Relaxed) {
             let Ok(keycode) = u8::try_from(keycode) else {
                 return true;
@@ -719,7 +719,6 @@ impl InputHandler {
                 },
                 OverviewRoute::Command(command) => Event::Command { command },
                 OverviewRoute::PassThrough => return false,
-                OverviewRoute::Swallow => return true,
             };
             _ = events
                 .send(event)
@@ -783,14 +782,13 @@ fn over_overview_window(event: &CGEvent) -> bool {
 /// Where a key goes while the overview is open.
 #[derive(Debug, PartialEq)]
 pub(crate) enum OverviewRoute {
-    /// A bare overview key: sent as [`Event::OverviewKey`].
+    /// A bare key, sent as an overview key event ([`Event::OverviewKey`]). The
+    /// overview uses its own keys and ignores the rest.
     Overview,
     /// A Paneru binding: runs as usual, on the focused window.
     Command(Command),
     /// An unbound chord: left for macOS and other applications.
     PassThrough,
-    /// An unbound bare key: typing never reaches the hidden focused window.
-    Swallow,
 }
 
 /// Routes a key pressed while the overview is open. `binding` is what the key
@@ -809,7 +807,7 @@ pub(crate) fn overview_route(
     if modifiers.intersects(CHORD_MODIFIERS) {
         OverviewRoute::PassThrough
     } else {
-        OverviewRoute::Swallow
+        OverviewRoute::Overview
     }
 }
 
@@ -1287,6 +1285,7 @@ mod tests {
     }
 
     const KEY_A: u8 = 0;
+    const KEY_1: u8 = 18;
     const KEY_X: u8 = 7;
     const KEY_W: u8 = 13;
     const KEY_L: u8 = 37;
@@ -1326,6 +1325,11 @@ mod tests {
             "a bound bare key runs too"
         );
         assert_eq!(
+            overview_route(KEY_1, Modifiers::empty(), Some(Command::Lua(1))),
+            OverviewRoute::Command(Command::Lua(1)),
+            "a bound badge key runs its binding"
+        );
+        assert_eq!(
             overview_route(KEY_ESCAPE, Modifiers::empty(), Some(Command::Lua(1))),
             OverviewRoute::Overview,
             "Escape can't be bound away"
@@ -1333,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn unbound_keys_in_the_overview_pass_chords_and_swallow_typing() {
+    fn unbound_keys_in_the_overview_pass_chords_and_send_typing_to_the_overview() {
         assert_eq!(
             overview_route(KEY_W, Modifiers::LCMD, None),
             OverviewRoute::PassThrough
@@ -1344,11 +1348,11 @@ mod tests {
         );
         assert_eq!(
             overview_route(KEY_A, Modifiers::empty(), None),
-            OverviewRoute::Swallow
+            OverviewRoute::Overview
         );
         assert_eq!(
             overview_route(KEY_A, Modifiers::LSHIFT, None),
-            OverviewRoute::Swallow
+            OverviewRoute::Overview
         );
     }
 

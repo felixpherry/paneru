@@ -330,16 +330,27 @@ overview, and it follows them. While it is open:
 
 | Key | Effect |
 | :--- | :--- |
-| Arrow keys | Move focus: ←/→ between columns, ↑/↓ within a stack, then to the workspace above/below |
+| Arrow keys | Move focus: ←/→ between columns, ↑/↓ within a stack, then to the workspace above/below. Clears a half-typed badge |
+| Badge keys (`1`–`0` by default) | Jump: focus that window (switching workspace if needed) and close |
+| `Backspace` | Undo the last typed badge key |
 | Any Paneru binding | Runs as usual on the focused window; the overview follows |
-| `Return` / keypad `Enter` / `Escape` / the `overview` binding | Close, leaving focus where it is |
+| `Return` / keypad `Enter` / the `overview` binding | Close, leaving focus where it is |
+| `Escape` | Close; first clears a half-typed label |
 | Other ⌘/⌥/⌃ chords | Pass through to macOS and other apps |
-| Plain typing | Swallowed |
+| Other plain typing | Swallowed |
 
-Clicking a tile focuses that window (switching workspace if needed) and closes;
-clicking anywhere else closes. A click on something drawn above the overview,
-such as a screenshot selection, goes to that instead. The overview closes if
-the active display changes, and will not open while Mission Control is showing.
+**Badges** label every tile at least partly on screen: the focused row first,
+left to right, then the rows above and below, nearest first. With more tiles
+than keys, the last key becomes a prefix for two-key labels (`01`, `02`, …). A
+tile keeps its label until the overview closes. A bare key bound in your config
+runs its binding instead of acting as a badge key. `shortcuts = false` turns
+badges off.
+
+Clicking a tile focuses that window first (switching workspace if needed), then
+the overview zooms in onto it; clicking anywhere else closes. A click on
+something drawn above the overview, such as a screenshot selection, goes to that
+instead. The overview closes if the active display changes, and will not open
+while Mission Control is showing.
 
 The backdrop is the display's desktop picture (or a solid `scrim_color` when
 there is no still image), dimmed by `scrim_opacity`, so no window shows through.
