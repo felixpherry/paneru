@@ -36,6 +36,10 @@
 
 **Layout modes.** Each virtual workspace row is laid out as scrolling, dwindle or master, starting in scrolling, and `window layout toggle` cycles the shown row of the active display through them in that order without touching other rows or native fullscreen rows. All three modes arrange the same column order, so switching never adds, drops or reorders a window, and a stacked or tabbed column fills one tile. A row's mode is saved with the session, and its dwindle splits are rebuilt from the column order whenever the row enters dwindle.
 
+**Dwindle rows.** A column joining a dwindle row splits the tile of the column it is inserted after along that tile's longer side and takes the right or bottom half (a column joining at the front splits the first tile and takes its left or top half), and a column that leaves gives its space to its sibling, so no other tile moves.
+
 **Master rows.** A master row places its first column on the left at the master width — half the screen until `window resize` and `window shrink` step it through the preset column widths — and stacks every other column on the right at equal heights.
+
+**Tiled rows own sizes.** Dwindle and master rows never scroll, and width commands, width rules, Lua width changes and mouse resizes leave their tiled windows at their tile size (a window that can't shrink that far keeps its minimum size and ends at the screen edge, over its neighbour). Within a session, a row returning to scrolling gives each column back the width it had when it left scrolling; after a restart it comes back at its tile sizes.
 
 **Focus by tile.** In dwindle and master rows, directional focus and swap first walk a stacked tile, then go to the nearest tile on screen that way, and a swap exchanges the two columns' places.
