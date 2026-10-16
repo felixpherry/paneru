@@ -34,7 +34,7 @@ fn stack() -> Event {
 }
 
 /// The app opens window `id`, which takes focus.
-fn open_window(world: &mut World, state: &MockState, id: WinID) {
+pub(super) fn open_window(world: &mut World, state: &MockState, id: WinID) {
     let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
     let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, id, frame);
     world.trigger(SpawnWindowTrigger(vec![window]));

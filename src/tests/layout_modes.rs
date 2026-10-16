@@ -1,8 +1,8 @@
 //! Layout modes: `window layout toggle` cycles the row on screen through
 //! scrolling → dwindle → master. Tests 1–3 assert the mode value; the rest
-//! assert frames on the 1024×748 test viewport at y = 20. Until Phase 3,
-//! dwindle draws master's tiles, so dwindle checks here only use layouts both
-//! agree on (two columns side by side; three as one left, two right).
+//! assert frames on the 1024×748 test viewport at y = 20. Dwindle and master
+//! agree on two columns (side by side) and three (one left, two stacked
+//! right), so the width and no-scroll tests hold in either mode.
 
 use bevy::prelude::*;
 
@@ -13,8 +13,10 @@ use crate::ecs::state::{SavedLayout, SavedStrip};
 use crate::ecs::tiling::{DEFAULT_MASTER_RATIO, Tiling};
 use crate::ecs::{ActiveWorkspaceMarker, DockPosition, FullWidthMarker, ReshuffleAroundMarker};
 use crate::events::Event;
-use crate::{assert_window_at, assert_window_size};
+use crate::{assert_focused, assert_window_at, assert_window_size};
 
+use super::close_focus::open_window;
+use super::interaction::settle;
 use super::*;
 
 fn toggle() -> Event {
@@ -387,4 +389,33 @@ fn dock_change_retiles_a_master_row() {
                 command: Command::PrintState,
             },
         ]);
+}
+
+/// Spec tests 8 and 9. Window 3 opens beside the focused window 0 and splits
+/// only 0's tile, taking its bottom half (the tile is taller than wide);
+/// closing it gives 0 the whole tile back. Master's tiles, or a spiral rebuilt
+/// from the column order, would keep 0 whole and move 1 and 2 instead.
+#[test]
+fn dwindle_open_splits_the_focused_tile_and_close_gives_it_back() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 0);
+            three_tiles(world, state.clone());
+            open_window(world, &state, 3);
+        })
+        .on_iteration(2, |world, state| {
+            assert_window_at!(world, 0, 0, TOP);
+            assert_window_size!(world, 0, 512, 374);
+            assert_window_at!(world, 3, 0, TOP + 374);
+            assert_window_size!(world, 3, 512, 374);
+            assert_window_at!(world, 1, 512, TOP);
+            assert_window_size!(world, 1, 512, 374);
+            assert_window_at!(world, 2, 512, TOP + 374);
+            assert_window_size!(world, 2, 512, 374);
+            state.os_close_window(3);
+        })
+        .on_iteration(3, three_tiles)
+        .run(vec![settle(), toggle(), settle(), settle()]);
 }

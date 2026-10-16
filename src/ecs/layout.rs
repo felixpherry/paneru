@@ -14,7 +14,7 @@ use tracing::{Level, instrument, trace};
 
 use crate::config::Config;
 use crate::ecs::params::Windows;
-use crate::ecs::tiling::{DEFAULT_MASTER_RATIO, Tiling, master_tiles};
+use crate::ecs::tiling::{SplitTree, Tiling, master_tiles};
 use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
@@ -937,7 +937,7 @@ impl LayoutStrip {
     where
         W: Fn(Entity) -> Option<IRect>,
     {
-        let ratio = match self.tiling {
+        let tiles = match &self.tiling {
             Tiling::Scrolling => {
                 return self
                     .column_positions(get_window_frame)
@@ -952,14 +952,15 @@ impl LayoutStrip {
                     })
                     .collect();
             }
-            Tiling::Master(ratio) => ratio,
-            // ponytail: dwindle borrows the master tiles until Phase 3 builds its split tree.
-            Tiling::Dwindle(_) => DEFAULT_MASTER_RATIO,
+            Tiling::Master(ratio) => master_tiles(self.columns.len(), viewport, *ratio),
+            // Synced on a copy: the overview can read a row before the layout
+            // pass has synced its stored tree.
+            Tiling::Dwindle(tree) => SplitTree::sync(tree.clone(), &self.column_members())
+                .map_or_else(Vec::new, |tree| {
+                    tree.tiles(IRect::new(0, 0, viewport.x, viewport.y))
+                }),
         };
-        self.columns
-            .iter()
-            .zip(master_tiles(self.columns.len(), viewport, ratio))
-            .collect()
+        self.columns.iter().zip(tiles).collect()
     }
 
     #[instrument(level = Level::TRACE, skip_all)]
@@ -1130,6 +1131,23 @@ impl LayoutStrip {
     /// scrolling.
     pub fn is_tiled(&self) -> bool {
         !matches!(self.tiling, Tiling::Scrolling)
+    }
+
+    /// Brings a dwindle row's split tree in line with its columns (see
+    /// [`SplitTree::sync`]). Other modes keep no tree.
+    pub fn sync_tiling(&mut self) {
+        if let Tiling::Dwindle(tree) = &self.tiling {
+            self.tiling = Tiling::Dwindle(SplitTree::sync(tree.clone(), &self.column_members()));
+        }
+    }
+
+    /// Each column's windows, in column order: what a dwindle tree's leaves
+    /// are matched against.
+    fn column_members(&self) -> Vec<Vec<Entity>> {
+        self.columns
+            .iter()
+            .map(|column| column.window_iter().collect())
+            .collect()
     }
 
     /// Toggles tabbed display (one window visible at a time, sharing the
@@ -1325,15 +1343,22 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
 }
 
 /// Watches for changes to `LayoutStrip` (i.e. a window added or window order changed) and
-/// re-calculates the logical positions of all the windows in the layout strip.
+/// re-calculates the logical positions of all the windows in the layout strip, after
+/// syncing a dwindle row's split tree to its columns.
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn layout_strip_changed(
-    changed_strips: Populated<(&LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
+    mut changed_strips: Populated<(&mut LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
     mut windows: WindowFrames,
     displays: DisplayViewports,
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    // Syncing the tree is bookkeeping, not a layout change: marking the row
+    // changed would re-run this pass every frame.
+    for (mut strip, _) in &mut changed_strips {
+        strip.bypass_change_detection().sync_tiling();
+    }
+
     let get_window_frame = |entity| {
         windows
             .get(entity)
@@ -1345,7 +1370,7 @@ pub(super) fn layout_strip_changed(
     };
 
     let changed = changed_strips
-        .into_iter()
+        .iter()
         .filter_map(|(layout_strip, child_of)| {
             displays
                 .get(child_of.parent())
@@ -2575,6 +2600,44 @@ mod tests {
                 (e[2], IRect::new(512, 0, 1024, 748)),
             ]
         );
+    }
+
+    /// A dwindle row the layout pass hasn't synced yet (the overview can read
+    /// one) tiles from a tree synced on a copy, and `sync_tiling` stores that
+    /// same tree: a spiral from the column order.
+    #[test]
+    fn test_dwindle_tiles_a_spiral_before_and_after_sync() {
+        let mut world = World::new();
+        let e = world
+            .spawn_batch(vec![(), (), (), ()])
+            .collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::default();
+        for &entity in &e {
+            strip.append(entity);
+        }
+        strip.set_tiling(Tiling::Dwindle(None));
+
+        let get_window_frame = |_| Some(IRect::new(0, 0, 400, 748));
+        let spiral = vec![
+            (e[0], IRect::new(0, 0, 512, 748)),
+            (e[1], IRect::new(512, 0, 1024, 374)),
+            (e[2], IRect::new(512, 374, 768, 748)),
+            (e[3], IRect::new(768, 374, 1024, 748)),
+        ];
+        let unsynced: Vec<_> = strip
+            .relative_positions(Size::new(1024, 748), &get_window_frame)
+            .collect();
+        assert_eq!(unsynced, spiral);
+
+        strip.sync_tiling();
+        assert!(
+            matches!(strip.tiling(), Tiling::Dwindle(Some(_))),
+            "the tree is stored"
+        );
+        let synced: Vec<_> = strip
+            .relative_positions(Size::new(1024, 748), &get_window_frame)
+            .collect();
+        assert_eq!(synced, spiral);
     }
 
     #[test]
