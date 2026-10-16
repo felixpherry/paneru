@@ -6,8 +6,8 @@ use crate::ecs::params::Windows;
 use crate::ecs::restore::CurrentWindowIdentity;
 use crate::ecs::state::QueryState;
 use crate::ecs::state::{
-    PaneruQueryState, PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStackItem,
-    SavedStrip, SavedWindow, SavedWorkspace,
+    PaneruQueryState, PaneruState, SavedColumn, SavedDisplay, SavedLayout, SavedRect,
+    SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker};
 use crate::events::Event;
@@ -100,6 +100,7 @@ fn test_state_serialization() {
             display_id: Some(TEST_DISPLAY_ID),
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(window)],
             }],
@@ -135,6 +136,7 @@ fn test_state_restoration() {
             display_id: None,
             active_virtual_index: Some(1),
             strips: vec![SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 1,
                 columns: vec![SavedColumn::Single(window)],
             }],
@@ -355,6 +357,7 @@ fn restore_plan_compacts_missing_windows_and_preserves_active_virtual_row() {
         active_virtual_index: Some(1),
         strips: vec![
             SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_window(
                     10,
@@ -364,6 +367,7 @@ fn restore_plan_compacts_missing_windows_and_preserves_active_virtual_row() {
                 ))],
             },
             SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 1,
                 columns: vec![
                     SavedColumn::Tabs(vec![
@@ -436,10 +440,12 @@ fn restore_plan_prefers_later_hard_match_over_earlier_fallback_match() {
         active_virtual_index: Some(0),
         strips: vec![
             SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_a)],
             },
             SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 1,
                 columns: vec![SavedColumn::Single(saved_b)],
             },
@@ -479,6 +485,7 @@ fn restore_plan_skips_ambiguous_fallback_match() {
         display_id: None,
         active_virtual_index: Some(0),
         strips: vec![SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 0,
             columns: vec![SavedColumn::Single(saved)],
         }],
@@ -511,6 +518,7 @@ fn restore_plan_skips_space_that_no_longer_exists() {
         display_id: Some(TEST_DISPLAY_ID),
         active_virtual_index: None,
         strips: vec![SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 0,
             columns: vec![SavedColumn::Single(saved)],
         }],

@@ -250,6 +250,8 @@ pub enum Operation {
     /// window visible at a time, sharing the full column). Cycle tabs with
     /// the existing `Focus` North/South directions.
     ToggleTabbedDisplay,
+    /// Cycles the active row's layout: scrolling → dwindle → master.
+    ToggleLayout,
     /// Resizes and repositions the focused window to fit within the visible viewport
     /// (including edge padding).
     Snap,

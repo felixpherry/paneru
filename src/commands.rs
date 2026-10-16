@@ -21,6 +21,7 @@ use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
 };
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
+use crate::ecs::tiling::Tiling;
 use crate::ecs::workspace::{PreviousStripPosition, column_closest_to_center};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, FocusedMarker, FullWidthMarker,
@@ -133,6 +134,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             copy_window_rule,
             close_window,
             toggle_tabbed_display_handler,
+            toggle_layout,
         )
             .in_set(crate::ecs::PreUpdateSet::Dispatch),
     );
@@ -1684,6 +1686,57 @@ pub fn toggle_tabbed_display_handler(
             );
         }
     }
+}
+
+/// Cycles the row on screen through scrolling → dwindle → master → scrolling.
+/// Native fullscreen rows always stay scrolling.
+#[instrument(level = Level::DEBUG, skip_all)]
+pub fn toggle_layout(
+    mut messages: MessageReader<Event>,
+    mut active: Single<(Entity, &mut LayoutStrip), With<ActiveWorkspaceMarker>>,
+    display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
+    windows: Windows,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::ToggleLayout))
+        .next()
+        .is_none()
+    {
+        return;
+    }
+    let (strip_entity, strip) = &mut *active;
+    if strip.is_fullscreen() {
+        return;
+    }
+    let next = strip.tiling().next();
+    match next {
+        // A tiled row never scrolls: pin it to the viewport and drop any
+        // deliberate offset (center, snap) left from scrolling.
+        Tiling::Dwindle(_) => {
+            if let Ok(mut entity_commands) = commands.get_entity(*strip_entity) {
+                entity_commands.try_remove::<ManualStripOffset>();
+            }
+            let (display, dock) = *display;
+            commands.reposition_entity(
+                *strip_entity,
+                display.actual_display_bounds(dock, &config).min,
+            );
+        }
+        // Back to scrolling: scroll the strip to the focused window again.
+        Tiling::Scrolling => {
+            let around = windows
+                .focused()
+                .map(|(_, entity)| entity)
+                .filter(|entity| strip.contains(*entity))
+                .or_else(|| strip.columns().next().and_then(Column::top));
+            if let Some(entity) = around {
+                commands.reshuffle_around(entity);
+            }
+        }
+        Tiling::Master(_) => {}
+    }
+    strip.set_tiling(next);
 }
 
 /// Dispatches a command based on the `CommandTrigger` event.

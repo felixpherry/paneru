@@ -7,7 +7,8 @@ use crate::commands::{Command, Operation};
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::state::{
-    PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStrip, SavedWindow, SavedWorkspace,
+    PaneruState, SavedColumn, SavedDisplay, SavedLayout, SavedRect, SavedStrip, SavedWindow,
+    SavedWorkspace,
 };
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{SpawnWindowTrigger, Unmanaged};
@@ -42,6 +43,7 @@ fn test_startup_restore_rebuilds_virtual_workspace_layout() {
             display_id: Some(TEST_DISPLAY_ID),
             active_virtual_index: Some(1),
             strips: vec![SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 1,
                 columns: vec![
                     SavedColumn::Single(saved_window(0)),
@@ -94,6 +96,7 @@ fn test_startup_restore_keeps_unmatched_windows_on_the_restored_row() {
             display_id: Some(TEST_DISPLAY_ID),
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_window(0))],
             }],
@@ -144,6 +147,7 @@ fn test_startup_restore_keeps_fullscreen_separate_from_unmatched_windows() {
             display_id: Some(TEST_DISPLAY_ID),
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Fullscreen(saved_window(0))],
             }],
@@ -187,6 +191,7 @@ fn restored_fullscreen_row_returns_home_when_it_leaves_fullscreen() {
         display_id: Some(TEST_DISPLAY_ID),
         active_virtual_index: Some(0),
         strips: vec![SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 0,
             columns: vec![column],
         }],
@@ -296,6 +301,7 @@ fn test_startup_restore_prefers_existing_workspace_parent_before_saved_or_active
             display_id: Some(EXT_DISPLAY_ID),
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_window(200))],
             }],
@@ -368,6 +374,7 @@ fn test_startup_restore_preserves_saved_display_when_present() {
             display_id: Some(EXT_DISPLAY_ID),
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 0,
                 columns: vec![SavedColumn::Single(saved_window(300))],
             }],
@@ -438,6 +445,7 @@ fn test_startup_restore_keeps_current_native_workspace_active_across_multiple_wo
                 display_id: Some(TEST_DISPLAY_ID),
                 active_virtual_index: Some(0),
                 strips: vec![SavedStrip {
+                    layout: SavedLayout::Scrolling,
                     virtual_index: 0,
                     columns: vec![SavedColumn::Single(saved_window(100))],
                 }],
@@ -447,6 +455,7 @@ fn test_startup_restore_keeps_current_native_workspace_active_across_multiple_wo
                 display_id: Some(EXT_DISPLAY_ID),
                 active_virtual_index: Some(0),
                 strips: vec![SavedStrip {
+                    layout: SavedLayout::Scrolling,
                     virtual_index: 0,
                     columns: vec![SavedColumn::Single(saved_window(300))],
                 }],
@@ -507,6 +516,7 @@ fn test_restore_resource_is_removed_after_grace_period() {
         .app
         .world_mut()
         .insert_resource(state_with_strips(vec![SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 0,
             columns: vec![SavedColumn::Single(saved_window(0))],
         }]));
@@ -586,6 +596,7 @@ fn state_save_is_blocked_during_startup_and_restore() {
     TestHarness::new()
         .with_windows(1)
         .with_state(state_with_strips(vec![SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 0,
             columns: vec![SavedColumn::Single(saved_window(0))],
         }]))
@@ -627,6 +638,7 @@ enabled = false
         .app
         .world_mut()
         .insert_resource(state_with_strips(vec![SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 1,
             columns: vec![SavedColumn::Single(saved_window(0))],
         }]));
@@ -661,6 +673,7 @@ enabled = false
 fn test_startup_restore_uses_first_restored_row_when_active_metadata_is_missing() {
     let mut harness = TestHarness::new().with_windows(1);
     let mut state = state_with_strips(vec![SavedStrip {
+        layout: SavedLayout::Scrolling,
         virtual_index: 2,
         columns: vec![SavedColumn::Single(saved_window(0))],
     }]);
@@ -698,6 +711,7 @@ fn test_startup_restore_overrides_floating_config_for_matched_window() {
         .app
         .world_mut()
         .insert_resource(state_with_strips(vec![SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 0,
             columns: vec![SavedColumn::Single(saved_window(0))],
         }]));
@@ -721,6 +735,7 @@ fn test_late_startup_window_restores_during_grace_period() {
         .app
         .world_mut()
         .insert_resource(state_with_strips(vec![SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 1,
             columns: vec![SavedColumn::Single(saved_window(99))],
         }]));
@@ -803,10 +818,12 @@ fn test_startup_restore_keeps_one_selected_row_and_hides_inactive_rows() {
             active_virtual_index: Some(1),
             strips: vec![
                 SavedStrip {
+                    layout: SavedLayout::Scrolling,
                     virtual_index: 0,
                     columns: vec![SavedColumn::Single(saved_window(0))],
                 },
                 SavedStrip {
+                    layout: SavedLayout::Scrolling,
                     virtual_index: 1,
                     columns: vec![SavedColumn::Single(saved_window(1))],
                 },
@@ -865,6 +882,7 @@ fn test_startup_restore_keeps_emptied_baseline_row() {
             display_id: Some(TEST_DISPLAY_ID),
             active_virtual_index: Some(1),
             strips: vec![SavedStrip {
+                layout: SavedLayout::Scrolling,
                 virtual_index: 1,
                 columns: vec![
                     SavedColumn::Single(saved_window(0)),
@@ -909,18 +927,22 @@ fn test_startup_restore_compacts_rows_with_dynamic_workspaces() {
         .into();
     let state = state_with_strips(vec![
         SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 0,
             columns: vec![SavedColumn::Single(saved_window(0))],
         },
         SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 4,
             columns: vec![SavedColumn::Single(saved_window(1))],
         },
         SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 6,
             columns: vec![],
         },
         SavedStrip {
+            layout: SavedLayout::Scrolling,
             virtual_index: 8,
             columns: vec![],
         },
@@ -998,6 +1020,7 @@ fn test_emptied_baseline_row_is_parked_and_repositions_moved_windows() {
                 display_id: Some(TEST_DISPLAY_ID),
                 active_virtual_index: Some(0),
                 strips: vec![SavedStrip {
+                    layout: SavedLayout::Scrolling,
                     virtual_index: 0,
                     columns: vec![
                         SavedColumn::Single(saved_window(0)),
@@ -1010,6 +1033,7 @@ fn test_emptied_baseline_row_is_parked_and_repositions_moved_windows() {
                 display_id: Some(TEST_DISPLAY_ID),
                 active_virtual_index: Some(1),
                 strips: vec![SavedStrip {
+                    layout: SavedLayout::Scrolling,
                     virtual_index: 1,
                     columns: vec![SavedColumn::Single(saved_window(2))],
                 }],

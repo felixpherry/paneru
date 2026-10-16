@@ -97,6 +97,10 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "stack" => Operation::Stack(true),
         "unstack" => Operation::Stack(false),
         "tabbeddisplay" => Operation::ToggleTabbedDisplay,
+        "layout" => match argument()? {
+            "toggle" => Operation::ToggleLayout,
+            _ => return Err(err()),
+        },
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
         "display" => Operation::ToDisplay(Direction::parse(argument()?)?),
@@ -217,6 +221,7 @@ impl Operation {
             Operation::Stack(true) => owned(&["stack"]),
             Operation::Stack(false) => owned(&["unstack"]),
             Operation::ToggleTabbedDisplay => owned(&["tabbeddisplay"]),
+            Operation::ToggleLayout => owned(&["layout", "toggle"]),
             Operation::Snap => owned(&["snap"]),
             Operation::Virtual(direction) => vec!["virtual".to_string(), direction.token()],
             Operation::FocusOrVirtual(direction) => {
@@ -279,6 +284,7 @@ mod tests {
             Operation::Stack(true),
             Operation::Stack(false),
             Operation::ToggleTabbedDisplay,
+            Operation::ToggleLayout,
             Operation::Snap,
             Operation::Virtual(Direction::First),
             Operation::FocusOrVirtual(Direction::North),
@@ -350,11 +356,21 @@ mod tests {
     }
 
     #[test]
+    fn window_layout_toggle_parses() {
+        assert_eq!(
+            parse_command(&["window", "layout", "toggle"]),
+            Ok(Command::Window(Operation::ToggleLayout))
+        );
+    }
+
+    #[test]
     fn invalid_commands_are_rejected() {
         assert!(parse_command(&["definitely", "not", "a", "command"]).is_err());
         assert!(parse_command(&["window", "focus"]).is_err());
         assert!(parse_command(&["window", "swap", "3"]).is_err());
         assert!(parse_command(&["showmenu", "extra"]).is_err());
         assert!(parse_command(&["hidemenu", "extra"]).is_err());
+        assert!(parse_command(&["window", "layout"]).is_err());
+        assert!(parse_command(&["window", "layout", "bogus"]).is_err());
     }
 }

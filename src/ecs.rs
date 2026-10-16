@@ -52,6 +52,7 @@ pub mod script_state;
 pub mod scroll;
 pub mod state;
 pub(crate) mod systems;
+pub mod tiling;
 mod triggers;
 pub mod workspace;
 

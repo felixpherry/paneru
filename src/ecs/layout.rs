@@ -14,6 +14,7 @@ use tracing::{Level, instrument, trace};
 
 use crate::config::Config;
 use crate::ecs::params::Windows;
+use crate::ecs::tiling::Tiling;
 use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
@@ -387,6 +388,9 @@ pub struct LayoutStrip {
     /// and of `LayoutStrip::tabbed()`, which callers like
     /// `apply_window_positions` already keys off for that unrelated feature.
     tabbed_stacks: EntityHashSet,
+    /// How the row turns its column order into frames. Every row starts in
+    /// scrolling; only `window layout toggle` and session restore change it.
+    tiling: Tiling,
 }
 
 impl LayoutStrip {
@@ -396,6 +400,7 @@ impl LayoutStrip {
             virtual_index,
             columns: VecDeque::new(),
             tabbed_stacks: EntityHashSet::default(),
+            tiling: Tiling::Scrolling,
         }
     }
 
@@ -407,6 +412,7 @@ impl LayoutStrip {
             virtual_index: 0,
             columns,
             tabbed_stacks: EntityHashSet::default(),
+            tiling: Tiling::Scrolling,
         }
     }
 
@@ -1060,6 +1066,15 @@ impl LayoutStrip {
         self.columns
             .front()
             .is_some_and(|column| matches!(column, Column::Fullscren(_)))
+    }
+
+    /// How this row turns its column order into frames.
+    pub fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+
+    pub fn set_tiling(&mut self, tiling: Tiling) {
+        self.tiling = tiling;
     }
 
     /// Toggles tabbed display (one window visible at a time, sharing the

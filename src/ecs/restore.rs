@@ -15,7 +15,7 @@ use crate::config::{Config, MissingWindowBehavior};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{
-    PaneruState, SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
+    PaneruState, SavedColumn, SavedLayout, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
 use crate::ecs::workspace::{PreviousStripPosition, RestoredActivation};
 use crate::ecs::{
@@ -129,6 +129,7 @@ pub(crate) struct PlannedStrip {
     pub display_id: Option<CGDirectDisplayID>,
     pub virtual_index: u32,
     pub columns: Vec<PlannedColumn>,
+    pub layout: SavedLayout,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -208,6 +209,7 @@ impl<'a> RestorePlanner<'a> {
             display_id: workspace.display_id,
             virtual_index: strip.virtual_index,
             columns,
+            layout: strip.layout,
         })
     }
 
@@ -631,6 +633,7 @@ fn layout_strip_from_plan(planned: &PlannedStrip) -> LayoutStrip {
 
     let mut strip = LayoutStrip::new(planned.workspace_id, planned.virtual_index);
     apply_planned_columns(&mut strip, &planned.columns);
+    strip.set_tiling(planned.layout.into());
     strip
 }
 

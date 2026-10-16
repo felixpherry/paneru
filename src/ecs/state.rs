@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
 use crate::ecs::restore::SessionRestore;
+use crate::ecs::tiling::{DEFAULT_MASTER_RATIO, Tiling};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Initializing, SelectedVirtualMarker, Unmanaged,
 };
@@ -67,6 +68,41 @@ pub struct SavedWorkspace {
 pub struct SavedStrip {
     pub virtual_index: u32,
     pub columns: Vec<SavedColumn>,
+    /// Absent in state files written before layout modes: those rows load
+    /// as scrolling.
+    #[serde(default)]
+    pub layout: SavedLayout,
+}
+
+/// A row's layout mode as saved. Dwindle splits are rebuilt from the column
+/// order on restore, and master restarts at the default width.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedLayout {
+    #[default]
+    Scrolling,
+    Dwindle,
+    Master,
+}
+
+impl From<&Tiling> for SavedLayout {
+    fn from(tiling: &Tiling) -> Self {
+        match tiling {
+            Tiling::Scrolling => SavedLayout::Scrolling,
+            Tiling::Dwindle(_) => SavedLayout::Dwindle,
+            Tiling::Master(_) => SavedLayout::Master,
+        }
+    }
+}
+
+impl From<SavedLayout> for Tiling {
+    fn from(layout: SavedLayout) -> Self {
+        match layout {
+            SavedLayout::Scrolling => Tiling::Scrolling,
+            SavedLayout::Dwindle => Tiling::Dwindle(None),
+            SavedLayout::Master => Tiling::Master(DEFAULT_MASTER_RATIO),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -267,6 +303,7 @@ impl PaneruState {
             workspace.strips.push(SavedStrip {
                 virtual_index: strip.virtual_index,
                 columns: saved_columns,
+                layout: strip.tiling().into(),
             });
         }
 
