@@ -19,7 +19,7 @@ use tracing::{Level, debug, error, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
 use crate::commands::{
-    Direction, MoveFocus, Operation, filter_window_operations, get_window_in_direction,
+    Direction, MoveFocus, Operation, filter_window_operations, neighbour_in_direction,
 };
 use crate::config::Config;
 use crate::ecs::display::spawn_space_rows;
@@ -1315,8 +1315,9 @@ fn switch_virtual_workspace_bind(
     // "switch the virtual workspace", unconditionally, for anyone who binds
     // it that way — this new command is for callers who explicitly want
     // "focus a stack neighbor above/below first, and only switch workspace
-    // once there's nothing left to focus", the same within-column traversal
-    // `window_focus_north/south` uses. Only North/South are meaningful here
+    // once there's nothing left to focus", the same traversal
+    // `window_focus_north/south` uses (on a dwindle or master row, the tile
+    // above or below). Only North/South are meaningful here
     // (there's no "focus" reading of East/West/First/Last/Nth to pair with
     // a workspace switch); anything else is a no-op. Once the focus check
     // doesn't apply, this reduces to a plain `Operation::Virtual(direction)`
@@ -1325,10 +1326,11 @@ fn switch_virtual_workspace_bind(
     let operation = match operation {
         Operation::FocusOrVirtual(direction @ (Direction::North | Direction::South)) => {
             if let Some((_, focused_entity)) = windows.focused()
-                && let Some(target) = get_window_in_direction(
+                && let Some(target) = neighbour_in_direction(
                     direction,
                     focused_entity,
                     active_display.active_strip(),
+                    |entity| windows.layout_frame(entity),
                 )
             {
                 commands.focus_entity(target, true);

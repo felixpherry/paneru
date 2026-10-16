@@ -399,4 +399,14 @@ impl Windows<'_, '_> {
             .ok()
             .map(|(layout_position, _, _, _, _, _)| layout_position)
     }
+
+    /// The window's frame within its strip: its layout slot at the size it is
+    /// heading for. Directional focus compares these on a tiled row.
+    pub fn layout_frame(&self, entity: Entity) -> Option<IRect> {
+        let origin = self.layout_position(entity)?.0;
+        Some(IRect::from_corners(
+            origin,
+            origin + self.moving_frame(entity)?.size(),
+        ))
+    }
 }

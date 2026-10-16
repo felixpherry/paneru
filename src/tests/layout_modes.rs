@@ -1,7 +1,7 @@
 //! Layout modes: `window layout toggle` cycles the row on screen through
 //! scrolling → dwindle → master. Tests 1–3 assert the mode value; the rest
-//! assert frames on the 1024×748 test viewport at y = 20. Dwindle and master
-//! agree on two columns (side by side) and three (one left, two stacked
+//! assert frames or focus on the 1024×748 test viewport at y = 20. Dwindle and
+//! master agree on two columns (side by side) and three (one left, two stacked
 //! right), so the width and no-scroll tests hold in either mode.
 
 use bevy::prelude::*;
@@ -418,4 +418,122 @@ fn dwindle_open_splits_the_focused_tile_and_close_gives_it_back() {
         })
         .on_iteration(3, three_tiles)
         .run(vec![settle(), toggle(), settle(), settle()]);
+}
+
+/// Spec test 10, plus a swap across the row. A swap exchanges the two
+/// columns, so on a dwindle row the two windows trade tiles and nothing
+/// between them moves: at step 4 a move would also push window 0 down.
+#[test]
+fn dwindle_swap_trades_two_tiles() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 0);
+            three_tiles(world, state);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_window_at!(world, 1, 0, TOP);
+            assert_window_size!(world, 1, 512, 748);
+            assert_window_at!(world, 0, 512, TOP);
+            assert_window_size!(world, 0, 512, 374);
+            assert_window_at!(world, 2, 512, TOP + 374);
+            assert_window_size!(world, 2, 512, 374);
+        })
+        .on_iteration(3, |world, _state| assert_focused!(world, 2))
+        .on_iteration(4, |world, _state| {
+            assert_window_at!(world, 2, 0, TOP);
+            assert_window_size!(world, 2, 512, 748);
+            assert_window_at!(world, 0, 512, TOP);
+            assert_window_size!(world, 0, 512, 374);
+            assert_window_at!(world, 1, 512, TOP + 374);
+            assert_window_size!(world, 1, 512, 374);
+        })
+        .run(vec![
+            settle(),
+            toggle(),
+            op(Operation::Swap(Direction::East)),
+            op(Operation::Focus(Direction::Last)),
+            op(Operation::Swap(Direction::West)),
+        ]);
+}
+
+/// Spec test 12, plus `FocusOrVirtual`. From the master, East picks the top
+/// stack tile (both stack tiles are equally near; the earlier column wins).
+/// South then moves down the stack and ↑ (`FocusOrVirtual`) back up, where
+/// column order finds nothing.
+#[test]
+fn focus_follows_the_screen_in_master() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(2, |world, state| {
+            assert_focused!(world, 0);
+            three_tiles(world, state);
+        })
+        .on_iteration(3, |world, _state| assert_focused!(world, 1))
+        .on_iteration(4, |world, _state| assert_focused!(world, 2))
+        .on_iteration(5, |world, _state| assert_focused!(world, 1))
+        .run(vec![
+            settle(),
+            toggle(),
+            toggle(),
+            op(Operation::Focus(Direction::East)),
+            op(Operation::Focus(Direction::South)),
+            op(Operation::FocusOrVirtual(Direction::North)),
+        ]);
+}
+
+/// Spec test 13. On a master row, West from the bottom stack tile reaches the
+/// master; the swap makes window 2 the master and puts 0 in 2's old tile,
+/// while 1 stays put.
+#[test]
+fn swap_west_from_the_stack_makes_a_new_master() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(2, three_tiles)
+        .on_iteration(3, |world, _state| assert_focused!(world, 2))
+        .on_iteration(4, |world, _state| {
+            assert_window_at!(world, 2, 0, TOP);
+            assert_window_size!(world, 2, 512, 748);
+            assert_window_at!(world, 1, 512, TOP);
+            assert_window_size!(world, 1, 512, 374);
+            assert_window_at!(world, 0, 512, TOP + 374);
+            assert_window_size!(world, 0, 512, 374);
+        })
+        .run(vec![
+            settle(),
+            toggle(),
+            toggle(),
+            op(Operation::Focus(Direction::Last)),
+            op(Operation::Swap(Direction::West)),
+        ]);
+}
+
+/// Spec test 14. A tabbed stack's windows share one tile, so the screen finds
+/// nothing below window 0; ↓ walks the stack first and lands on the next tab.
+#[test]
+fn south_cycles_a_tabbed_tile_before_the_screen() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(4, |world, _state| {
+            assert_window_at!(world, 0, 0, TOP);
+            assert_window_size!(world, 0, 512, 748);
+            assert_window_at!(world, 1, 0, TOP);
+            assert_window_size!(world, 1, 512, 748);
+            assert_window_at!(world, 2, 512, TOP);
+            assert_window_size!(world, 2, 512, 748);
+        })
+        .on_iteration(5, |world, _state| assert_focused!(world, 0))
+        .on_iteration(6, |world, _state| assert_focused!(world, 1))
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            op(Operation::Focus(Direction::East)),
+            op(Operation::Stack(true)),
+            op(Operation::ToggleTabbedDisplay),
+            toggle(),
+            op(Operation::Focus(Direction::First)),
+            op(Operation::Focus(Direction::South)),
+        ]);
 }

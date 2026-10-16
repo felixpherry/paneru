@@ -237,6 +237,48 @@ fn pick_nearest_in_direction(
         .map(|(entity, _)| entity)
 }
 
+/// Where a directional move lands in `strip`: by column order on a scrolling
+/// row; on a dwindle or master row, within a stacked tile first, then the
+/// nearest tile on screen that way. `frame_of` gives strip-relative frames.
+pub(crate) fn neighbour_in_direction<F>(
+    direction: &Direction,
+    entity: Entity,
+    strip: &LayoutStrip,
+    frame_of: F,
+) -> Option<Entity>
+where
+    F: Fn(Entity) -> Option<IRect>,
+{
+    if !strip.is_tiled()
+        || matches!(
+            direction,
+            Direction::First | Direction::Last | Direction::Nth(_)
+        )
+    {
+        return get_window_in_direction(direction, entity, strip);
+    }
+    // ↑/↓ walk a stacked tile first. A tabbed stack's windows share one rect,
+    // so the screen alone would never find the next tab.
+    if matches!(direction, Direction::North | Direction::South)
+        && let Some(sibling) = get_window_in_direction(direction, entity, strip)
+    {
+        return Some(sibling);
+    }
+    let index = strip.index_of(entity).ok()?;
+    // One face per stack item of every other column, in column order, so a tie
+    // goes to the earlier column (`min_by_key` keeps the first minimum).
+    let faces = strip
+        .columns()
+        .enumerate()
+        .filter(|(other, _)| *other != index)
+        .flat_map(|(_, column)| match column {
+            Column::Stack(items) => items.iter().filter_map(StackItem::top).collect::<Vec<_>>(),
+            column => column.top().into_iter().collect(),
+        })
+        .filter_map(|face| frame_of(face).map(|frame| (face, frame.center())));
+    pick_nearest_in_direction(direction, frame_of(entity)?.center(), faces)
+}
+
 fn visible_floating_entities(
     windows: &Windows,
     window_manager: &WindowManager,
@@ -391,14 +433,17 @@ fn command_move_focus(
     // If focus is on a window that no longer lives in the active strip
     // (e.g. it just became floating, was minimised on another row, or
     // the OS handed focus to a window we don't track on this strip),
-    // `get_window_in_direction` would return None and the user would
+    // `neighbour_in_direction` would return None and the user would
     // be unable to leave that window. Enter the active strip from the
     // appropriate side so subsequent presses behave normally.
     let candidate = if active_strip.contains(focused_entity) {
-        get_window_in_direction(direction, focused_entity, active_strip).or_else(|| {
+        let frame_of = |entity| windows.layout_frame(entity);
+        neighbour_in_direction(direction, focused_entity, active_strip, frame_of).or_else(|| {
             // At the right edge going East, enter the fullscreen workspaces.
+            // On a tiled row that edge is the screen's: nothing east of it.
             (matches!(direction, Direction::East)
-                && active_strip.right_neighbour(focused_entity).is_none())
+                && (active_strip.is_tiled()
+                    || active_strip.right_neighbour(focused_entity).is_none()))
             .then(|| {
                 workspaces
                     .iter()
@@ -652,7 +697,8 @@ fn command_swap_focus(
     let mut handler = || {
         let (_, current) = windows.focused()?;
         let index = active_strip.index_of(current).ok()?;
-        let other_window = get_window_in_direction(direction, current, active_strip)?;
+        let frame_of = |entity| windows.layout_frame(entity);
+        let other_window = neighbour_in_direction(direction, current, active_strip, frame_of)?;
         let new_index = active_strip.index_of(other_window).ok()?;
         debug!(
             "swap {direction:?}: current={current} idx={index}, other={other_window} idx={new_index}, strip_len={}",
@@ -665,6 +711,10 @@ fn command_swap_focus(
             let pos_a = stack.iter().position(|i| i.contains(current))?;
             let pos_b = stack.iter().position(|i| i.contains(other_window))?;
             stack.swap(pos_a, pos_b);
+        } else if active_strip.is_tiled() {
+            // The two columns trade places, and so their tiles; nothing
+            // between them moves.
+            active_strip.swap(index, new_index);
         } else if index < new_index {
             (index..new_index).for_each(|idx| active_strip.swap(idx, idx + 1));
         } else {
@@ -2093,5 +2143,90 @@ mod tests {
             pick_nearest_in_direction(&Direction::Last, focused, candidates),
             None,
         );
+    }
+
+    /// A master row: e0 left, e1 above e2 on the right. Frames are
+    /// strip-relative, as `frame_of` gets them from the layout.
+    #[test]
+    fn neighbour_in_direction_follows_master_tiles() {
+        let mut world = World::new();
+        let e = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::default();
+        for &entity in &e {
+            strip.append(entity);
+        }
+        strip.set_tiling(Tiling::Master(0.5));
+        let frames = [
+            (e[0], IRect::new(0, 0, 512, 748)),
+            (e[1], IRect::new(512, 0, 1024, 374)),
+            (e[2], IRect::new(512, 374, 1024, 748)),
+        ];
+        let frame_of = |entity: Entity| {
+            frames
+                .iter()
+                .find(|(id, _)| *id == entity)
+                .map(|&(_, frame)| frame)
+        };
+        let go =
+            |direction: Direction, from| neighbour_in_direction(&direction, from, &strip, frame_of);
+
+        // e1 and e2 are equally near the master: the earlier column wins.
+        assert_eq!(go(Direction::East, e[0]), Some(e[1]));
+        assert_eq!(go(Direction::South, e[1]), Some(e[2]));
+        assert_eq!(go(Direction::North, e[2]), Some(e[1]));
+        // Column order would give e1 and e2 here.
+        assert_eq!(go(Direction::West, e[2]), Some(e[0]));
+        assert_eq!(go(Direction::East, e[1]), None);
+        // First / Last / Nth stay in column order.
+        assert_eq!(go(Direction::Last, e[0]), Some(e[2]));
+
+        // A scrolling row defers to column order, whatever the frames say.
+        strip.set_tiling(Tiling::Scrolling);
+        assert_eq!(
+            neighbour_in_direction(&Direction::East, e[1], &strip, frame_of),
+            Some(e[2])
+        );
+        assert_eq!(
+            neighbour_in_direction(&Direction::South, e[1], &strip, frame_of),
+            None
+        );
+    }
+
+    /// A master row with a tabbed stack: e1 and e2 share the top-right tile,
+    /// e3 sits below it.
+    #[test]
+    fn neighbour_in_direction_walks_a_stacked_tile_first() {
+        let mut world = World::new();
+        let e = world
+            .spawn_batch(vec![(), (), (), ()])
+            .collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::default();
+        for &entity in &e {
+            strip.append(entity);
+        }
+        strip.stack(e[2]).unwrap(); // [e0, Stack(e1, e2), e3]
+        strip.set_tiling(Tiling::Master(0.5));
+        let tile = IRect::new(512, 0, 1024, 374);
+        let frames = [
+            (e[0], IRect::new(0, 0, 512, 748)),
+            (e[1], tile),
+            (e[2], tile),
+            (e[3], IRect::new(512, 374, 1024, 748)),
+        ];
+        let frame_of = |entity: Entity| {
+            frames
+                .iter()
+                .find(|(id, _)| *id == entity)
+                .map(|&(_, frame)| frame)
+        };
+        let go =
+            |direction: Direction, from| neighbour_in_direction(&direction, from, &strip, frame_of);
+
+        // The screen alone would pick e3; the stack comes first.
+        assert_eq!(go(Direction::South, e[1]), Some(e[2]));
+        // At the end of the stack, the screen takes over.
+        assert_eq!(go(Direction::South, e[2]), Some(e[3]));
+        // Into the stack: every item is a face, and the first of equals wins.
+        assert_eq!(go(Direction::North, e[3]), Some(e[1]));
     }
 }
