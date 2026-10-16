@@ -1775,7 +1775,8 @@ pub fn toggle_tabbed_display_handler(
 }
 
 /// Cycles the row on screen through scrolling → dwindle → master → scrolling.
-/// Native fullscreen rows always stay scrolling.
+/// Native fullscreen rows always stay scrolling. Leaving scrolling saves every
+/// window's size, and coming back gives those sizes back.
 #[instrument(level = Level::DEBUG, skip_all)]
 pub fn toggle_layout(
     mut messages: MessageReader<Event>,
@@ -1798,8 +1799,16 @@ pub fn toggle_layout(
     let next = strip.tiling().next();
     match next {
         // A tiled row never scrolls: pin it to the viewport and drop any
-        // deliberate offset (center, snap) left from scrolling.
+        // deliberate offset (center, snap) left from scrolling. Its sizes are
+        // the layout's from here on, so remember the scrolling ones (heights
+        // too: scrolling never rescales a stack).
         Tiling::Dwindle(_) => {
+            let sizes = strip
+                .all_windows()
+                .into_iter()
+                .filter_map(|entity| Some((entity, windows.moving_frame(entity)?.size())))
+                .collect();
+            strip.save_scrolling_sizes(sizes);
             if let Ok(mut entity_commands) = commands.get_entity(*strip_entity) {
                 entity_commands.try_remove::<ManualStripOffset>();
             }
@@ -1809,8 +1818,15 @@ pub fn toggle_layout(
                 display.actual_display_bounds(dock, &config).min,
             );
         }
-        // Back to scrolling: scroll the strip to the focused window again.
+        // Back to scrolling: give each window that is still here its old
+        // size (windows that joined while tiled keep their tile size), then
+        // scroll the strip to the focused window again.
         Tiling::Scrolling => {
+            for (entity, size) in strip.take_scrolling_sizes() {
+                if strip.contains(entity) {
+                    commands.resize_entity(entity, size);
+                }
+            }
             let around = windows
                 .focused()
                 .map(|(_, entity)| entity)

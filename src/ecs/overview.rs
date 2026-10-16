@@ -262,13 +262,14 @@ impl From<&Config> for OverviewConfig {
 /// vertically in `viewport` and the others stacked above and below it, each
 /// window a tile at its true strip-relative geometry.
 ///
-/// `rows` is `(strip entity, strip, is_active, centre)`; `centre` is the window
-/// whose column sits at the horizontal centre (the first column when `None` or
-/// not in the strip). `frame_of` gives a window's real frame: only its size
-/// feeds the layout (via [`LayoutStrip::relative_positions`]). The active row
-/// animates from those real frames; every other row from its place in the
-/// same layout at full size, stacked off screen, since its real frames sit
-/// parked in a corner.
+/// `rows` is `(strip entity, strip, is_active, centre)`; on a scrolling row
+/// `centre` is the window whose column sits at the horizontal centre (the
+/// first column when `None` or not in the strip), while a dwindle or master
+/// row is drawn as its whole screen. `frame_of` gives a window's real frame:
+/// only its size feeds the layout (via [`LayoutStrip::relative_positions`]).
+/// The active row animates from those real frames; every other row from its
+/// place in the same layout at full size, stacked off screen, since its real
+/// frames sit parked in a corner.
 pub fn project<F>(
     rows: &[(Entity, &LayoutStrip, bool, Option<Entity>)],
     viewport: IRect,
@@ -304,13 +305,18 @@ where
                 let band = IRect::new(left, top_target, left + zoomed.x, top_target + zoomed.y);
 
                 let rects = strip.relative_positions(full, frame_of).collect::<Vec<_>>();
-                // Stack and tab members share their item's x, so any of them
-                // anchors its column.
-                let anchor_x = rects
-                    .iter()
-                    .find(|(entity, _)| Some(*entity) == centre_window)
-                    .or(rects.first())
-                    .map_or(0, |(_, rect)| rect.center().x);
+                // A dwindle or master row is its whole screen. On a scrolling
+                // row stack and tab members share their item's x, so any of
+                // them anchors its column.
+                let anchor_x = if strip.is_tiled() {
+                    full.x / 2
+                } else {
+                    rects
+                        .iter()
+                        .find(|(entity, _)| Some(*entity) == centre_window)
+                        .or(rects.first())
+                        .map_or(0, |(_, rect)| rect.center().x)
+                };
                 let place = |rect: IRect, scale: f64, top: i32| {
                     let at = |point: IVec2| {
                         IVec2::new(

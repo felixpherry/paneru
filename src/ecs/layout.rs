@@ -401,6 +401,9 @@ pub struct LayoutStrip {
     /// How the row turns its column order into frames. Every row starts in
     /// scrolling; only `window layout toggle` and session restore change it.
     tiling: Tiling,
+    /// Each window's size when the row last left scrolling, given back when it
+    /// returns. Sizes, not widths: a stack must get its old heights back.
+    scrolling_sizes: EntityHashMap<Size>,
 }
 
 impl LayoutStrip {
@@ -411,6 +414,7 @@ impl LayoutStrip {
             columns: VecDeque::new(),
             tabbed_stacks: EntityHashSet::default(),
             tiling: Tiling::Scrolling,
+            scrolling_sizes: EntityHashMap::default(),
         }
     }
 
@@ -423,6 +427,7 @@ impl LayoutStrip {
             columns,
             tabbed_stacks: EntityHashSet::default(),
             tiling: Tiling::Scrolling,
+            scrolling_sizes: EntityHashMap::default(),
         }
     }
 
@@ -1131,6 +1136,16 @@ impl LayoutStrip {
     /// scrolling.
     pub fn is_tiled(&self) -> bool {
         !matches!(self.tiling, Tiling::Scrolling)
+    }
+
+    /// Remembers each window's scrolling size as the row leaves scrolling.
+    pub fn save_scrolling_sizes(&mut self, sizes: EntityHashMap<Size>) {
+        self.scrolling_sizes = sizes;
+    }
+
+    /// The sizes saved when the row left scrolling, leaving none behind.
+    pub fn take_scrolling_sizes(&mut self) -> EntityHashMap<Size> {
+        std::mem::take(&mut self.scrolling_sizes)
     }
 
     /// Brings a dwindle row's split tree in line with its columns (see

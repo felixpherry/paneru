@@ -1121,7 +1121,7 @@ fn saved_display(display_id: u32, active: bool) -> SavedDisplay {
     }
 }
 
-fn state_with_strips(strips: Vec<SavedStrip>) -> PaneruState {
+pub(super) fn state_with_strips(strips: Vec<SavedStrip>) -> PaneruState {
     PaneruState {
         version: 2,
         timestamp: 123_456_789,
@@ -1159,7 +1159,7 @@ fn restored_strip_display_parent(
         .parent()
 }
 
-fn saved_window(window_id: i32) -> SavedWindow {
+pub(super) fn saved_window(window_id: i32) -> SavedWindow {
     SavedWindow {
         window_id,
         pid: TEST_PROCESS_ID,

@@ -1,15 +1,17 @@
 //! Layout modes: `window layout toggle` cycles the row on screen through
 //! scrolling → dwindle → master. Tests 1–3 assert the mode value; the rest
-//! assert frames or focus on the 1024×748 test viewport at y = 20. Dwindle and
-//! master agree on two columns (side by side) and three (one left, two stacked
-//! right), so the width and no-scroll tests hold in either mode.
+//! assert frames, focus or overview tiles on the 1024×748 test viewport at
+//! y = 20. Dwindle and master agree on two columns (side by side) and three
+//! (one left, two stacked right), so the width and no-scroll tests hold in
+//! either mode.
 
 use bevy::prelude::*;
 
 use crate::commands::{Command, Direction, Operation, ResizeDirection};
 use crate::config::{Config, MainOptions, default_preset_column_widths};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::state::{SavedLayout, SavedStrip};
+use crate::ecs::overview::Overview;
+use crate::ecs::state::{SavedColumn, SavedLayout, SavedStrip};
 use crate::ecs::tiling::{DEFAULT_MASTER_RATIO, Tiling};
 use crate::ecs::{ActiveWorkspaceMarker, DockPosition, FullWidthMarker, ReshuffleAroundMarker};
 use crate::events::Event;
@@ -17,6 +19,7 @@ use crate::{assert_focused, assert_window_at, assert_window_size};
 
 use super::close_focus::open_window;
 use super::interaction::settle;
+use super::session_restore::{saved_window, state_with_strips};
 use super::*;
 
 fn toggle() -> Event {
@@ -535,5 +538,99 @@ fn south_cycles_a_tabbed_tile_before_the_screen() {
             toggle(),
             op(Operation::Focus(Direction::First)),
             op(Operation::Focus(Direction::South)),
+        ]);
+}
+
+/// Row `[0] [1] [2+3]` in scrolling: window 1 at 600 wide (step 2), the
+/// others at 400, and 2 and 3 splitting their column evenly.
+fn scrolling_sizes(world: &mut World, _state: MockState) {
+    assert_window_size!(world, 0, 400, 748);
+    assert_window_size!(world, 1, 600, 748);
+    assert_window_size!(world, 2, 400, 374);
+    assert_window_size!(world, 3, 400, 374);
+}
+
+/// Spec test 15, with the stacked pair in its own column. In master the
+/// stack sits in the bottom-right tile at 187/187; back in scrolling every
+/// window gets its old size. Without the saved sizes the columns stay 512
+/// wide and the stack comes back 187/561.
+#[test]
+fn back_to_scrolling_restores_the_old_sizes() {
+    TestHarness::new()
+        .with_windows(4)
+        .on_iteration(1, |world, _state| assert_focused!(world, 1))
+        .on_iteration(4, scrolling_sizes)
+        .on_iteration(6, |world, _state| {
+            assert_window_size!(world, 0, 512, 748);
+            assert_window_size!(world, 1, 512, 374);
+            assert_window_size!(world, 2, 512, 187);
+            assert_window_size!(world, 3, 512, 187);
+        })
+        .on_iteration(7, |world, state| {
+            assert_eq!(active_row(world).1, Tiling::Scrolling);
+            scrolling_sizes(world, state);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            op(Operation::Focus(Direction::East)),
+            op(Operation::SetWidth(0.585_937_5)),
+            op(Operation::Focus(Direction::Last)),
+            op(Operation::Stack(true)),
+            toggle(),
+            toggle(),
+            toggle(),
+        ]);
+}
+
+/// Spec test 16. A row saved in master comes back in master after a restart,
+/// tiled as two half-screen tiles rather than its 400-wide scrolling columns.
+#[test]
+fn restart_restores_a_master_row() {
+    let state = state_with_strips(vec![SavedStrip {
+        layout: SavedLayout::Master,
+        virtual_index: 0,
+        columns: vec![
+            SavedColumn::Single(saved_window(0)),
+            SavedColumn::Single(saved_window(1)),
+        ],
+    }]);
+    TestHarness::new()
+        .with_windows(2)
+        .with_state(state)
+        .on_iteration(1, |world, state| {
+            assert_eq!(active_row(world).1, Tiling::Master(DEFAULT_MASTER_RATIO));
+            two_halves(world, state);
+        })
+        .run(idle(2));
+}
+
+/// Spec test 17. The overview draws a master row as its screen: at the
+/// default ½ zoom the tiles fill the row's band on the 1024×748 viewport at
+/// y = 20. Anchoring on the focused master column instead would shift every
+/// tile 128 px right.
+#[test]
+fn overview_draws_a_master_row_as_its_screen() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(3, |world, _state| {
+            let [w0, w1, w2] = [0, 1, 2].map(|id| find_window_entity(id, world));
+            let overview = world.get_resource::<Overview>().expect("overview open");
+            let (row, _) = overview.layout.find(w0).expect("tile");
+            let target = |entity| overview.layout.find(entity).expect("tile").1.target;
+            assert_eq!(
+                overview.layout.rows[row].band,
+                IRect::new(256, 207, 768, 581)
+            );
+            assert_eq!(target(w0), IRect::new(256, 207, 512, 581));
+            assert_eq!(target(w1), IRect::new(512, 207, 768, 394));
+            assert_eq!(target(w2), IRect::new(512, 394, 768, 581));
+        })
+        .run(vec![
+            settle(),
+            toggle(),
+            toggle(),
+            Event::Command {
+                command: Command::Overview,
+            },
         ]);
 }
