@@ -316,6 +316,7 @@ $ paneru send-cmd <command> [args...]
 | `window manage`            | Toggle managed/floating state                    |
 | `window equalize`          | Distribute equal heights in the focused stack    |
 | `window balance`           | Make all columns match the focused window width  |
+| `window layout toggle`     | Cycle the row between scrolling, dwindle and master |
 | `window stack`             | Stack the focused window onto its left neighbour |
 | `window unstack`           | Unstack the focused window into its own column   |
 | `window nextdisplay`       | Move the focused window to the next display      |
