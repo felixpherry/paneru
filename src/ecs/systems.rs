@@ -883,6 +883,11 @@ pub(super) fn window_resized_update_frame(
             // Floating window, don't nudge the strip.
             continue;
         };
+        // A tiled row never scrolls, and the layout puts the window back to
+        // its tile size: nudge neither the strip nor the window above.
+        if strip.is_tiled() {
+            continue;
+        }
         if tabbed {
             // Native tabs share a single layout slot. Keep the strip anchored
             // and let the tab sync/layout systems propagate the new size.

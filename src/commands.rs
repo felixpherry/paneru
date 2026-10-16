@@ -752,6 +752,11 @@ fn command_center_window(
         && let Some(size) = windows.size(entity)
         && let Some(mut origin) = windows.origin(entity)
     {
+        let strip = active_display.active_strip();
+        // A tiled row never scrolls; floating windows still centre.
+        if strip.is_tiled() && strip.contains(entity) {
+            return;
+        }
         let center = active_display.bounds().center().x;
         origin.x = center - size.x / 2;
 
@@ -779,6 +784,27 @@ fn command_center_window(
     }
 }
 
+/// The preset after `current` in `direction`, skipping any within 0.05 of it
+/// so float noise can't re-pick the current one. Past the end it wraps when
+/// `cycle` is on, else stays at the end. `presets` is sorted ascending.
+fn next_preset(presets: &[f64], current: f64, direction: ResizeDirection, cycle: bool) -> f64 {
+    let first = presets.first().copied().unwrap_or(0.5);
+    let last = presets.last().copied().unwrap_or(first);
+    match direction {
+        ResizeDirection::Grow => presets
+            .iter()
+            .copied()
+            .find(|&r| r > current + 0.05)
+            .unwrap_or(if cycle { first } else { last }),
+        ResizeDirection::Shrink => presets
+            .iter()
+            .rev()
+            .copied()
+            .find(|&r| r < current - 0.05)
+            .unwrap_or(if cycle { last } else { first }),
+    }
+}
+
 /// Resizes the focused window based on preset column widths.
 ///
 /// # Arguments
@@ -791,7 +817,7 @@ fn command_center_window(
 fn resize_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    active_display: ActiveDisplay,
+    mut active_display: ActiveDisplayMut,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -808,6 +834,28 @@ fn resize_window(
     else {
         return;
     };
+
+    let widths = config.preset_column_widths();
+    let cycle = config.window_resize_cycle();
+    // A tiled row owns its windows' widths. On a master row the width keys
+    // step the master width instead; nothing else applies.
+    let strip = active_display.active_strip();
+    if strip.is_tiled() && strip.contains(entity) {
+        if let Operation::Resize(direction) = operation
+            && let Tiling::Master(ratio) = *strip.tiling()
+        {
+            let presets = widths
+                .iter()
+                .copied()
+                .filter(|&r| 0.05 < r && r < 0.95)
+                .collect::<Vec<_>>();
+            strip.set_tiling(Tiling::Master(next_preset(
+                &presets, ratio, *direction, cycle,
+            )));
+        }
+        return;
+    }
+
     if windows.full_width(entity).is_some()
         && let Ok(mut cmds) = commands.get_entity(entity)
     {
@@ -816,34 +864,9 @@ fn resize_window(
 
     let viewport = active_display.actual_bounds(&config);
     let current_ratio = f64::from(frame.width()) / f64::from(viewport.width());
-    let widths = config.preset_column_widths();
-    let fallback = *widths.first().unwrap_or(&0.5);
-    let cycle = config.window_resize_cycle();
     let next_ratio = match operation {
         Operation::SetWidth(ratio) if ratio.is_finite() && *ratio > 0.0 => *ratio,
-        Operation::Resize(ResizeDirection::Grow) => widths
-            .iter()
-            .copied()
-            .find(|&r| r > current_ratio + 0.05)
-            .unwrap_or_else(|| {
-                if cycle {
-                    fallback
-                } else {
-                    *widths.last().unwrap_or(&fallback)
-                }
-            }),
-        Operation::Resize(ResizeDirection::Shrink) => widths
-            .iter()
-            .rev()
-            .copied()
-            .find(|&r| r < current_ratio - 0.05)
-            .unwrap_or_else(|| {
-                if cycle {
-                    *widths.last().unwrap_or(&fallback)
-                } else {
-                    fallback
-                }
-            }),
+        Operation::Resize(direction) => next_preset(&widths, current_ratio, *direction, cycle),
         _ => return,
     };
 
@@ -1001,6 +1024,11 @@ fn full_width_window(
     let Some((_, entity)) = windows.focused() else {
         return;
     };
+    // A tiled row owns its windows' sizes, and full width would unstack.
+    let strip = active_display.active_strip();
+    if strip.is_tiled() && strip.contains(entity) {
+        return;
+    }
 
     let viewport = active_display.actual_bounds(&config);
 
@@ -1530,6 +1558,10 @@ fn balance_strip(
     {
         return;
     }
+    // A tiled row owns its windows' widths.
+    if active_display.active_strip().is_tiled() {
+        return;
+    }
 
     let Some((_, focused_entity)) = windows.focused() else {
         return;
@@ -1576,6 +1608,10 @@ fn snap_window(
         .next()
         .is_none()
     {
+        return;
+    }
+    // A tiled row never scrolls.
+    if active_display.active_strip().is_tiled() {
         return;
     }
 

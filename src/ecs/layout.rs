@@ -14,12 +14,12 @@ use tracing::{Level, instrument, trace};
 
 use crate::config::Config;
 use crate::ecs::params::Windows;
-use crate::ecs::tiling::Tiling;
+use crate::ecs::tiling::{DEFAULT_MASTER_RATIO, Tiling, master_tiles};
 use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
     ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, ResizeMarker, Scrolling,
-    SpawnCommandsExt,
+    SelectedVirtualMarker, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -59,6 +59,15 @@ type StripPlacements<'w, 's> = Query<
 /// Displays paired with the Dock's current edge, which is what turns a display's
 /// raw bounds into the usable viewport.
 type DisplayViewports<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
+
+/// Displays whose viewport may have moved: the display itself or its Dock
+/// changed. Read by [`retile_on_viewport_change`].
+type ChangedViewports<'w, 's> = Populated<
+    'w,
+    's,
+    (Entity, &'static Display, Option<&'static DockPosition>),
+    Or<(Changed<Display>, Changed<DockPosition>)>,
+>;
 
 /// A strip, its entity, its own scroll position (and any in-flight target),
 /// whether it's mid-swipe, and its parent display. Used by
@@ -183,6 +192,7 @@ impl Plugin for LayoutEventsPlugin {
                 // Wait for finish_setup before tiling: until then every window
                 // sits in the active strip regardless of its real display.
                 (
+                    retile_on_viewport_change,
                     layout_sizes_changed,
                     layout_strip_changed,
                     reshuffle_layout_strip,
@@ -920,17 +930,51 @@ impl LayoutStrip {
         self.columns.iter()
     }
 
-    #[instrument(level = Level::TRACE, skip_all, fields(layout_strip_height))]
+    /// One strip-relative rect per column, in column order. Scrolling lays
+    /// columns edge to edge at their top window's width and the full viewport
+    /// height; dwindle and master cut the viewport into tiles.
+    fn column_rects<W>(&self, viewport: Size, get_window_frame: &W) -> Vec<(&Column, IRect)>
+    where
+        W: Fn(Entity) -> Option<IRect>,
+    {
+        let ratio = match self.tiling {
+            Tiling::Scrolling => {
+                return self
+                    .column_positions(get_window_frame)
+                    .filter_map(|(column, x)| {
+                        // Every window in a column shares the master's (top
+                        // item's) width, so a window stacked onto a master of a
+                        // different width resizes to match it instead of keeping
+                        // its own width. This also matches the column slot width
+                        // from column_positions, which is the widest member.
+                        let width = column.top().and_then(get_window_frame)?.width();
+                        Some((column, IRect::new(x, 0, x + width, viewport.y)))
+                    })
+                    .collect();
+            }
+            Tiling::Master(ratio) => ratio,
+            // ponytail: dwindle borrows the master tiles until Phase 3 builds its split tree.
+            Tiling::Dwindle(_) => DEFAULT_MASTER_RATIO,
+        };
+        self.columns
+            .iter()
+            .zip(master_tiles(self.columns.len(), viewport, ratio))
+            .collect()
+    }
+
+    #[instrument(level = Level::TRACE, skip_all)]
     pub fn relative_positions<W>(
         &self,
-        layout_strip_height: i32,
+        viewport: Size,
         get_window_frame: &W,
     ) -> impl Iterator<Item = (Entity, IRect)>
     where
         W: Fn(Entity) -> Option<IRect>,
     {
-        self.column_positions(get_window_frame)
-            .filter_map(move |(column, position)| {
+        let tiled = self.is_tiled();
+        self.column_rects(viewport, get_window_frame)
+            .into_iter()
+            .filter_map(move |(column, rect)| {
                 let items: Vec<StackItem> = match column {
                     Column::Single(entity) | Column::Fullscren(entity) => {
                         vec![StackItem::Single(*entity)]
@@ -952,36 +996,41 @@ impl LayoutStrip {
                         .any(|e| self.tabbed_stacks.contains(&e));
 
                 let heights = if is_tabbed_column {
-                    vec![layout_strip_height; items.len()]
+                    vec![rect.height(); items.len()]
                 } else {
-                    let current_heights = items
+                    let mut current_heights = items
                         .iter()
                         .filter_map(|item| item.top().and_then(get_window_frame))
                         .map(|frame| frame.height())
                         .collect::<Vec<_>>();
-                    binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)?
+                    // The layout fixes a tile's height: scale the stack to fill
+                    // it, keeping its proportions, so a stack survives mode
+                    // switches and `window equalize` still shares a tile evenly.
+                    if tiled {
+                        let total = current_heights
+                            .iter()
+                            .map(|&height| i64::from(height))
+                            .sum::<i64>()
+                            .max(1);
+                        for height in &mut current_heights {
+                            *height = i32::try_from(
+                                i64::from(*height) * i64::from(rect.height()) / total,
+                            )
+                            .unwrap_or(0);
+                        }
+                    }
+                    binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, rect.height())?
                 };
 
-                // Every window in a column shares the master's (top item's)
-                // width, so a window stacked onto a master of a different width
-                // resizes to match it instead of keeping its own width. This
-                // also matches the column slot width from column_positions,
-                // which is the widest member.
-                let column_width = items
-                    .first()
-                    .and_then(StackItem::top)
-                    .and_then(get_window_frame)
-                    .map(|frame| frame.width())?;
-
-                let mut next_y = 0;
+                let mut next_y = rect.min.y;
                 let frames = items
                     .into_iter()
                     .zip(heights)
                     .filter_map(|(item, height)| {
                         let entity = item.top()?;
                         let mut frame = get_window_frame(entity)?;
-                        frame.min.x = position;
-                        frame.max.x = frame.min.x + column_width;
+                        frame.min.x = rect.min.x;
+                        frame.max.x = rect.max.x;
 
                         frame.min.y = next_y;
                         frame.max.y = frame.min.y + height;
@@ -1075,6 +1124,12 @@ impl LayoutStrip {
 
     pub fn set_tiling(&mut self, tiling: Tiling) {
         self.tiling = tiling;
+    }
+
+    /// Whether the row tiles the viewport (dwindle or master) instead of
+    /// scrolling.
+    pub fn is_tiled(&self) -> bool {
+        !matches!(self.tiling, Tiling::Scrolling)
     }
 
     /// Toggles tabbed display (one window visible at a time, sharing the
@@ -1198,6 +1253,35 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
     Some(output)
 }
 
+/// Dwindle and master tiles are cut from the viewport, so a display or Dock
+/// change re-tiles that display's tiled rows and moves the shown ones to the
+/// new viewport origin.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn retile_on_viewport_change(
+    displays: ChangedViewports,
+    mut strips: Query<(
+        Entity,
+        &mut LayoutStrip,
+        &ChildOf,
+        Has<SelectedVirtualMarker>,
+    )>,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    for (display_entity, display, dock) in &displays {
+        let origin = display.actual_display_bounds(dock, &config).min;
+        for (strip_entity, mut strip, child_of, shown) in &mut strips {
+            if child_of.parent() != display_entity || !strip.is_tiled() {
+                continue;
+            }
+            strip.set_changed();
+            if shown {
+                commands.reposition_entity(strip_entity, origin);
+            }
+        }
+    }
+}
+
 /// Watches for size changes to windows and if they are changed, signals to the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn layout_sizes_changed(
@@ -1248,6 +1332,7 @@ pub(super) fn layout_strip_changed(
     mut windows: WindowFrames,
     displays: DisplayViewports,
     config: Res<Config>,
+    mut commands: Commands,
 ) {
     let get_window_frame = |entity| {
         windows
@@ -1265,20 +1350,30 @@ pub(super) fn layout_strip_changed(
             displays
                 .get(child_of.parent())
                 .map(|(display, dock)| {
-                    let height = display.actual_display_bounds(dock, &config).height();
-                    layout_strip.relative_positions(height, &get_window_frame)
+                    let viewport = display.actual_display_bounds(dock, &config).size();
+                    let tiled = layout_strip.is_tiled();
+                    layout_strip
+                        .relative_positions(viewport, &get_window_frame)
+                        .map(move |(entity, frame)| (entity, frame, tiled))
                 })
                 .ok()
         })
         .flatten()
         .collect::<Vec<_>>();
 
-    for (entity, frame) in changed {
+    for (entity, frame, tiled) in changed {
         if let Ok((_, mut bounds, mut layout_position, resize)) = windows.get_mut(entity) {
             if layout_position.0 != frame.min {
                 layout_position.0 = frame.min;
             }
-            if resize.is_none() && bounds.0 != frame.size() {
+            if tiled {
+                // A tiled row owns its windows' sizes: steer any other size
+                // request (width keys, rules, Lua, an outside resize) back to
+                // the tile, animated.
+                if resize.map_or(bounds.0, |resize| resize.0) != frame.size() {
+                    commands.resize_entity(entity, frame.size());
+                }
+            } else if resize.is_none() && bounds.0 != frame.size() {
                 bounds.0 = frame.size();
             }
         }
@@ -1347,6 +1442,13 @@ pub(super) fn reshuffle_layout_strip(
                 "reshuffle_layout_strip: skipping newly active workspace {}",
                 ctx.strip_entity
             );
+            return;
+        }
+        // A tiled row never scrolls: keep it at the viewport origin.
+        if ctx.strip.is_tiled() {
+            if ctx.strip_target != ctx.display_bounds.min {
+                commands.reposition_entity(ctx.strip_entity, ctx.display_bounds.min);
+            }
             return;
         }
         let Some(frame) = windows.moving_frame(entity) else {
@@ -1485,7 +1587,7 @@ fn ensure_visible_in_strip(
         // before the `&mut Position` query below is touched — Bevy treats
         // the two queries as conflicting system params even though they're
         // never live at the same time here.
-        let Some((strip_entity, strip_target, viewport, is_new_activation)) =
+        let Some((strip_entity, strip_target, viewport, is_new_activation, tiled)) =
             resolve_strip_scroll_context(entity, &strip_params.p0(), &displays, &config).map(
                 |ctx| {
                     (
@@ -1493,6 +1595,7 @@ fn ensure_visible_in_strip(
                         ctx.strip_target,
                         ctx.display_bounds,
                         ctx.is_new_activation,
+                        ctx.strip.is_tiled(),
                     )
                 },
             )
@@ -1512,7 +1615,13 @@ fn ensure_visible_in_strip(
         // the strip's current position is on its way somewhere else, so the
         // target offset is what the window's slot will actually be measured
         // against - the same projection `reshuffle_layout_strip` makes.
-        let scroll_to = origin_exposing(layout_position.0, size, strip_target, viewport);
+        // A tiled row never scrolls: the only correction is back to the
+        // viewport origin.
+        let scroll_to = if tiled {
+            viewport.min
+        } else {
+            origin_exposing(layout_position.0, size, strip_target, viewport)
+        };
         if scroll_to == strip_target {
             continue;
         }
@@ -2222,7 +2331,7 @@ mod tests {
         _ = strip.stack(entities[2]);
         let get_window_frame = |_| Some(sizes[0]);
         let out = strip
-            .relative_positions(500, &get_window_frame)
+            .relative_positions(Size::new(1024, 500), &get_window_frame)
             .collect::<Vec<_>>();
 
         let xpos = out.iter().map(|(_, frame)| frame.min.x).collect::<Vec<_>>();
@@ -2247,7 +2356,9 @@ mod tests {
         }
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 400));
-        let out: Vec<_> = strip.relative_positions(800, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 800), &get_window_frame)
+            .collect();
 
         assert_eq!(out.len(), 3);
         for (_, f) in &out {
@@ -2288,7 +2399,9 @@ mod tests {
             }
         };
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 600), &get_window_frame)
+            .collect();
         assert_eq!(out.len(), 4);
 
         // Every window in the stacked column must adopt the master's width.
@@ -2378,7 +2491,9 @@ mod tests {
         strip.toggle_tabbed_display(entities[1]);
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 400, 300));
-        let out: Vec<_> = strip.relative_positions(700, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 700), &get_window_frame)
+            .collect();
 
         assert_eq!(out.len(), 3);
         for (_, frame) in &out {
@@ -2393,6 +2508,73 @@ mod tests {
         // All three must be at the identical x too (same column slot).
         let xs: std::collections::HashSet<_> = out.iter().map(|(_, f)| f.min.x).collect();
         assert_eq!(xs.len(), 1, "every tab must share the same column x");
+    }
+
+    /// A stacked column in master's stack area keeps its windows' proportions,
+    /// scaled to fill its tile.
+    #[test]
+    fn test_master_scales_a_stack_into_its_tile() {
+        let mut world = World::new();
+        let e = world
+            .spawn_batch(vec![(), (), (), ()])
+            .collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::default();
+        for &entity in &e {
+            strip.append(entity);
+        }
+        strip.stack(e[2]).unwrap(); // [e0, Stack(e1, e2), e3]
+        strip.set_tiling(Tiling::Master(0.5));
+
+        let get_window_frame = |entity: Entity| {
+            Some(if entity == e[1] {
+                IRect::new(0, 0, 300, 300)
+            } else if entity == e[2] {
+                IRect::new(0, 0, 300, 100)
+            } else {
+                IRect::new(0, 0, 400, 748)
+            })
+        };
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 748), &get_window_frame)
+            .collect();
+        assert_eq!(
+            out,
+            vec![
+                (e[0], IRect::new(0, 0, 512, 748)),
+                // 300:100 of the 374 px tile, floored (280, 93); the last item
+                // takes the remainder.
+                (e[1], IRect::new(512, 0, 1024, 280)),
+                (e[2], IRect::new(512, 280, 1024, 374)),
+                (e[3], IRect::new(512, 374, 1024, 748)),
+            ]
+        );
+    }
+
+    /// A tabbed stack in a tile gives every member the whole tile.
+    #[test]
+    fn test_tabbed_stack_fills_its_master_tile() {
+        let mut world = World::new();
+        let e = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::default();
+        for &entity in &e {
+            strip.append(entity);
+        }
+        strip.stack(e[2]).unwrap(); // [e0, Stack(e1, e2)]
+        assert_eq!(strip.toggle_tabbed_display(e[1]), Some(true));
+        strip.set_tiling(Tiling::Master(0.5));
+
+        let get_window_frame = |_| Some(IRect::new(0, 0, 400, 300));
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 748), &get_window_frame)
+            .collect();
+        assert_eq!(
+            out,
+            vec![
+                (e[0], IRect::new(0, 0, 512, 748)),
+                (e[1], IRect::new(512, 0, 1024, 748)),
+                (e[2], IRect::new(512, 0, 1024, 748)),
+            ]
+        );
     }
 
     #[test]
@@ -2412,7 +2594,9 @@ mod tests {
         strip.toggle_tabbed_display(entities[1]);
         strip.toggle_tabbed_display(entities[1]);
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 600), &get_window_frame)
+            .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(
             heights.iter().sum::<i32>(),
@@ -2535,7 +2719,9 @@ mod tests {
 
         // relative_positions should yield e1, e4 (same frame) and e2
         let get_window_frame = |_| Some(IRect::new(0, 0, 100, 100));
-        let out: Vec<_> = strip.relative_positions(400, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 400), &get_window_frame)
+            .collect();
 
         // We expect e1, e4, e2 from the first column, and e3 from the second.
         assert_eq!(out.len(), 4);
@@ -2564,7 +2750,9 @@ mod tests {
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 250));
 
         // Before unstack: e0 and e1 share 500px height.
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 500), &get_window_frame)
+            .collect();
         let e1_height = out
             .iter()
             .find(|(e, _)| *e == entities[1])
@@ -2577,7 +2765,9 @@ mod tests {
         strip.unstack(entities[1]).unwrap();
         assert_eq!(strip.len(), 3);
 
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 500), &get_window_frame)
+            .collect();
         for (_, f) in &out {
             assert_eq!(
                 f.height(),
@@ -2601,21 +2791,27 @@ mod tests {
 
         // Stack: [Stack(e0, e1)]
         strip.stack(entities[1]).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 500), &get_window_frame)
+            .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
         assert_eq!(heights.len(), 2);
 
         // Unstack: [Single(e0), Single(e1)]
         strip.unstack(entities[1]).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 500), &get_window_frame)
+            .collect();
         for (_, f) in &out {
             assert_eq!(f.height(), 500);
         }
 
         // Re-stack: [Stack(e0, e1)] — e1 stacks onto left neighbor e0
         strip.stack(entities[1]).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 500), &get_window_frame)
+            .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
         assert_eq!(heights.len(), 2);
@@ -2654,7 +2850,9 @@ mod tests {
             }
         };
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 600), &get_window_frame)
+            .collect();
         assert_eq!(out.len(), 3);
 
         // Columns must be edge-to-edge: each column starts where the previous ends.
@@ -2690,7 +2888,9 @@ mod tests {
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 600));
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .relative_positions(Size::new(1024, 600), &get_window_frame)
+            .collect();
         let xs: Vec<_> = out.iter().map(|(_, f)| f.min.x).collect();
         assert_eq!(xs, vec![0, 300, 600]);
 
@@ -2830,7 +3030,7 @@ mod tests {
         };
 
         let out = strip
-            .relative_positions(600, &get_window_frame)
+            .relative_positions(Size::new(1024, 600), &get_window_frame)
             .collect::<Vec<_>>();
 
         assert_eq!(out.len(), 2);

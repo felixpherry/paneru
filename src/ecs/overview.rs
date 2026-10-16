@@ -303,9 +303,7 @@ where
                 let left = centre.x - zoomed.x / 2;
                 let band = IRect::new(left, top_target, left + zoomed.x, top_target + zoomed.y);
 
-                let rects = strip
-                    .relative_positions(full.y, frame_of)
-                    .collect::<Vec<_>>();
+                let rects = strip.relative_positions(full, frame_of).collect::<Vec<_>>();
                 // Stack and tab members share their item's x, so any of them
                 // anchors its column.
                 let anchor_x = rects

@@ -103,6 +103,11 @@ fn swipe_gesture(
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    // A tiled row never scrolls: drop the gesture.
+    if active_display.active_strip().is_tiled() {
+        messages.clear();
+        return;
+    }
     let swipe_sensitivity = config.swipe_sensitivity();
     let mut total_delta = 0.0;
     let mut gesture_delta = 0.0;

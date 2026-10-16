@@ -1,6 +1,10 @@
 //! How a row turns its column order into window frames.
 
 use bevy::ecs::entity::Entity;
+use bevy::math::IRect;
+
+use crate::manager::Size;
+use crate::util::round_px;
 
 /// How a row turns its column order into window frames.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -30,6 +34,29 @@ impl Tiling {
     }
 }
 
+/// Master tiles over a `size` viewport at origin (0, 0), one per column in
+/// column order: the first column on the left at `ratio` of the width, every
+/// other column stacked on the right at equal heights, the last taking the
+/// rounding remainder.
+pub fn master_tiles(count: usize, size: Size, ratio: f64) -> Vec<IRect> {
+    if count < 2 {
+        return vec![IRect::new(0, 0, size.x, size.y); count];
+    }
+    let master = round_px(ratio * f64::from(size.x));
+    let stacked = i32::try_from(count - 1).unwrap_or(i32::MAX);
+    let height = size.y / stacked;
+    std::iter::once(IRect::new(0, 0, master, size.y))
+        .chain((0..stacked).map(|i| {
+            let bottom = if i + 1 == stacked {
+                size.y
+            } else {
+                (i + 1) * height
+            };
+            IRect::new(master, i * height, size.x, bottom)
+        }))
+        .collect()
+}
+
 /// A dwindle row's split tree. An in-order walk of its leaves is the row's
 /// column order; each leaf holds one member window of its column as an anchor.
 #[expect(
@@ -56,5 +83,30 @@ mod tests {
         let master = dwindle.next();
         assert_eq!(master, Tiling::Master(DEFAULT_MASTER_RATIO));
         assert_eq!(master.next(), Tiling::Scrolling);
+    }
+
+    #[test]
+    fn master_tiles_split_the_viewport() {
+        let size = Size::new(1024, 748);
+        assert!(master_tiles(0, size, 0.5).is_empty());
+        assert_eq!(master_tiles(1, size, 0.5), [IRect::new(0, 0, 1024, 748)]);
+        assert_eq!(
+            master_tiles(2, size, 0.5),
+            [IRect::new(0, 0, 512, 748), IRect::new(512, 0, 1024, 748)]
+        );
+        assert_eq!(
+            master_tiles(4, size, 0.5),
+            [
+                IRect::new(0, 0, 512, 748),
+                IRect::new(512, 0, 1024, 249),
+                IRect::new(512, 249, 1024, 498),
+                IRect::new(512, 498, 1024, 748),
+            ]
+        );
+        // A ⅔ master: round_px(0.66667 × 1024) = 683.
+        assert_eq!(
+            master_tiles(2, size, 0.66667),
+            [IRect::new(0, 0, 683, 748), IRect::new(683, 0, 1024, 748)]
+        );
     }
 }

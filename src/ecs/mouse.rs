@@ -356,6 +356,10 @@ fn mouse_resize_trigger(
         };
         let (strip_entity, strip, strip_position) = *active_workspace;
         let floating = !strip.contains(entity);
+        // A tiled row owns its windows' sizes and never scrolls.
+        if !floating && strip.is_tiled() {
+            continue;
+        }
 
         let mut frame = window.frame();
         let center = frame.center();
