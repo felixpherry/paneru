@@ -58,21 +58,21 @@ pub fn master_tiles(count: usize, size: Size, ratio: f64) -> Vec<IRect> {
 }
 
 /// A dwindle row's split tree. An in-order walk of its leaves is the row's
-/// column order; each leaf holds one member window of its column as an anchor.
+/// column order; each leaf holds its column's windows as of the last sync.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SplitTree {
-    /// One column's tile, anchored on one of its windows.
-    Leaf(Entity),
+    /// One column's tile and that column's windows.
+    Leaf(Vec<Entity>),
     /// A tile cut in half — side by side when at least as wide as tall, else
     /// stacked; the first child takes the left or top half.
     Split(Box<SplitTree>, Box<SplitTree>),
 }
 
 impl SplitTree {
-    /// The leaves' anchors, in order.
-    pub fn leaves(&self) -> Vec<Entity> {
+    /// The leaves' windows, in order.
+    pub fn leaves(&self) -> Vec<&[Entity]> {
         match self {
-            SplitTree::Leaf(anchor) => vec![*anchor],
+            SplitTree::Leaf(windows) => vec![windows.as_slice()],
             SplitTree::Split(first, second) => [first.leaves(), second.leaves()].concat(),
         }
     }
@@ -113,14 +113,13 @@ impl SplitTree {
     }
 
     /// Whether the tree matches `members` (column `i`'s windows at index `i`):
-    /// one leaf per column, leaf `i` anchored on a window of column `i`.
+    /// one leaf per column, leaf `i` holding column `i`'s windows in any order.
     pub fn in_sync(&self, members: &[Vec<Entity>]) -> bool {
         let leaves = self.leaves();
         leaves.len() == members.len()
-            && leaves
-                .iter()
-                .zip(members)
-                .all(|(anchor, column)| column.contains(anchor))
+            && leaves.iter().zip(members).all(|(leaf, column)| {
+                leaf.len() == column.len() && column.iter().all(|window| leaf.contains(window))
+            })
     }
 
     /// Brings `tree` in line with a row's columns (`members[i]` = column `i`'s
@@ -130,27 +129,26 @@ impl SplitTree {
         if tree.as_ref().is_some_and(|tree| tree.in_sync(members)) {
             return tree;
         }
-        // Each leaf claims the column holding its anchor and re-anchors on that
-        // column's first window. A leaf whose column left the row, or that an
-        // earlier leaf already claimed (two columns stacked into one), goes.
+        // Each leaf claims the first unclaimed column holding one of its
+        // windows. A stack split in two (unstack) keeps its leaf on the first
+        // piece, and the second piece is a new column right after it, so it
+        // splits the stack's own tile. A leaf with no such column (its windows
+        // left the row, or were stacked into a column an earlier leaf claimed)
+        // goes.
         let mut claimed = vec![false; members.len()];
         let mut tree = tree.and_then(|tree| {
-            tree.filter_map_leaves(&mut |anchor| {
-                let index = members.iter().position(|column| column.contains(&anchor))?;
-                if claimed[index] {
-                    return None;
-                }
+            tree.filter_map_leaves(&mut |windows| {
+                let index = members.iter().zip(&claimed).position(|(column, &taken)| {
+                    !taken && column.iter().any(|window| windows.contains(window))
+                })?;
                 claimed[index] = true;
-                members[index].first().copied()
+                Some(members[index].clone())
             })
         });
         // Each new column splits the tile of the column before it (column 0
         // splits the first tile).
         for (index, column) in members.iter().enumerate() {
-            let Some(&anchor) = column.first() else {
-                continue;
-            };
-            if claimed[index] {
+            if claimed[index] || column.is_empty() {
                 continue;
             }
             let before = index
@@ -158,30 +156,30 @@ impl SplitTree {
                 .and_then(|before| members[before].first().copied());
             tree = Some(match tree {
                 Some(mut tree) => {
-                    tree.split(before, anchor);
+                    tree.split(before, column);
                     tree
                 }
-                None => SplitTree::Leaf(anchor),
+                None => SplitTree::Leaf(column.clone()),
             });
         }
-        // Leaf k anchors on column k's first window, so a new column 0 gets the
-        // first half of the tile it split, and two exchanged columns trade tiles.
-        let mut anchors = members.iter().filter_map(|column| column.first().copied());
-        tree.and_then(|tree| tree.filter_map_leaves(&mut |_| anchors.next()))
+        // Leaf k takes column k's windows, so a new column 0 gets the first half
+        // of the tile it split, and two exchanged columns trade tiles.
+        let mut columns = members.iter().filter(|column| !column.is_empty()).cloned();
+        tree.and_then(|tree| tree.filter_map_leaves(&mut |_| columns.next()))
     }
 
-    /// The tree with each leaf re-anchored through `anchor`. A leaf it maps to
-    /// `None` goes, and its sibling takes the parent's place.
-    fn filter_map_leaves<F>(self, anchor: &mut F) -> Option<SplitTree>
+    /// The tree with each leaf's windows replaced through `windows`. A leaf it
+    /// maps to `None` goes, and its sibling takes the parent's place.
+    fn filter_map_leaves<F>(self, windows: &mut F) -> Option<SplitTree>
     where
-        F: FnMut(Entity) -> Option<Entity>,
+        F: FnMut(Vec<Entity>) -> Option<Vec<Entity>>,
     {
         match self {
-            SplitTree::Leaf(leaf) => anchor(leaf).map(SplitTree::Leaf),
+            SplitTree::Leaf(leaf) => windows(leaf).map(SplitTree::Leaf),
             SplitTree::Split(first, second) => {
                 match (
-                    first.filter_map_leaves(anchor),
-                    second.filter_map_leaves(anchor),
+                    first.filter_map_leaves(windows),
+                    second.filter_map_leaves(windows),
                 ) {
                     (Some(first), Some(second)) => {
                         Some(SplitTree::Split(Box::new(first), Box::new(second)))
@@ -192,19 +190,21 @@ impl SplitTree {
         }
     }
 
-    /// Splits the leaf anchored on `at` (the first leaf when `None`) into it
-    /// and a new leaf anchored on `anchor`. Returns whether it found the leaf.
-    fn split(&mut self, at: Option<Entity>, anchor: Entity) -> bool {
+    /// Splits the leaf holding `at` (the first leaf when `None`) into it and a
+    /// new leaf holding `windows`. Returns whether it found the leaf.
+    fn split(&mut self, at: Option<Entity>, windows: &[Entity]) -> bool {
         match self {
-            SplitTree::Leaf(leaf) if at.is_none_or(|at| at == *leaf) => {
+            SplitTree::Leaf(leaf) if at.is_none_or(|at| leaf.contains(&at)) => {
                 *self = SplitTree::Split(
-                    Box::new(SplitTree::Leaf(*leaf)),
-                    Box::new(SplitTree::Leaf(anchor)),
+                    Box::new(SplitTree::Leaf(std::mem::take(leaf))),
+                    Box::new(SplitTree::Leaf(windows.to_vec())),
                 );
                 true
             }
             SplitTree::Leaf(_) => false,
-            SplitTree::Split(first, second) => first.split(at, anchor) || second.split(at, anchor),
+            SplitTree::Split(first, second) => {
+                first.split(at, windows) || second.split(at, windows)
+            }
         }
     }
 }
@@ -279,7 +279,7 @@ mod tests {
         let [a, b, c] = spawn();
         let tree = SplitTree::sync(None, &singles(&[a, b, c]));
         assert_eq!(tiles(tree.as_ref()), three_tiles());
-        assert_eq!(tree.expect("a tree").leaves(), [a, b, c]);
+        assert_eq!(tree.expect("a tree").leaves(), singles(&[a, b, c]));
     }
 
     #[test]
@@ -299,10 +299,10 @@ mod tests {
         // At column 0 it splits the first tile and takes the top half.
         let first = SplitTree::sync(tree, &singles(&[new, a, b, c]));
         assert_eq!(tiles(first.as_ref()), a_split);
-        assert_eq!(first.expect("a tree").leaves(), [new, a, b, c]);
+        assert_eq!(first.expect("a tree").leaves(), singles(&[new, a, b, c]));
         // Two new columns in front of the only tile both get one.
-        let front = SplitTree::sync(Some(SplitTree::Leaf(c)), &singles(&[new, extra, c]));
-        assert_eq!(front.expect("a tree").leaves(), [new, extra, c]);
+        let front = SplitTree::sync(Some(SplitTree::Leaf(vec![c])), &singles(&[new, extra, c]));
+        assert_eq!(front.expect("a tree").leaves(), singles(&[new, extra, c]));
     }
 
     #[test]
@@ -324,7 +324,7 @@ mod tests {
             ]
         );
         // The only column leaves: no tree.
-        assert_eq!(SplitTree::sync(Some(SplitTree::Leaf(a)), &[]), None);
+        assert_eq!(SplitTree::sync(Some(SplitTree::Leaf(vec![a])), &[]), None);
     }
 
     #[test]
@@ -333,7 +333,7 @@ mod tests {
         let tree = SplitTree::sync(None, &singles(&[a, b, c]));
         let swapped = SplitTree::sync(tree, &singles(&[b, a, c]));
         assert_eq!(tiles(swapped.as_ref()), three_tiles());
-        assert_eq!(swapped.expect("a tree").leaves(), [b, a, c]);
+        assert_eq!(swapped.expect("a tree").leaves(), singles(&[b, a, c]));
     }
 
     #[test]
@@ -375,9 +375,28 @@ mod tests {
             assert!(tree.in_sync(&members));
             assert_eq!(SplitTree::sync(Some(tree.clone()), &members), Some(tree));
         }
-        // A leaf's anchor may sit anywhere in its column: a stack whose top
-        // changed (a focused tab moves to the front) is still in sync.
+        // Order inside a column doesn't count: a stack whose top changed (a
+        // focused tab moves to the front) is still in sync. A window moving to
+        // another column is not, even with the column count unchanged.
         let tree = SplitTree::sync(None, &[vec![a, b], vec![c]]).expect("a tree");
         assert!(tree.in_sync(&[vec![b, a], vec![c]]));
+        assert!(!tree.in_sync(&[vec![a], vec![b, c]]));
+    }
+
+    #[test]
+    fn unstacking_either_window_splits_the_stacks_own_tile() {
+        let [a, b, c] = spawn();
+        // B and C stacked right of A: the stack takes the right half.
+        let stacked = SplitTree::sync(None, &[vec![a], vec![b, c]]);
+        assert_eq!(
+            tiles(stacked.as_ref()),
+            [IRect::new(0, 0, 512, 748), IRect::new(512, 0, 1024, 748)]
+        );
+        // Unstack puts the rest of the stack first and the unstacked window
+        // after it. Either way the stack's tile splits and A keeps its half.
+        let bottom = SplitTree::sync(stacked.clone(), &singles(&[a, b, c]));
+        assert_eq!(tiles(bottom.as_ref()), three_tiles(), "C unstacked");
+        let top = SplitTree::sync(stacked, &singles(&[a, c, b]));
+        assert_eq!(tiles(top.as_ref()), three_tiles(), "B unstacked");
     }
 }
