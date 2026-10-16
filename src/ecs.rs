@@ -444,6 +444,15 @@ pub struct RepositionMarker(pub Origin);
 #[derive(Component, Debug, Deref, DerefMut)]
 pub struct ResizeMarker(pub Size);
 
+/// The last resize the OS refused: the size asked for and the size the window
+/// kept (an app's minimum size). Set by `window_resize_verifier`; a tiled row
+/// stops asking for `asked` while the window is still `got`.
+#[derive(Component, Debug)]
+pub struct ClampedSize {
+    pub asked: Size,
+    pub got: Size,
+}
+
 /// Marker component indicating that windows around the marked entity need to be reshuffled.
 #[derive(Component)]
 pub struct ReshuffleAroundMarker;

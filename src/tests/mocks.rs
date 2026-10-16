@@ -45,6 +45,10 @@ pub(crate) struct MockWindowData {
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
     pub(crate) child_role: bool,
+    /// The smallest size the app accepts; `resize` never goes below it.
+    pub(crate) min_size: Size,
+    /// How many times paneru resized this window.
+    pub(crate) resizes: u32,
 }
 
 impl Default for MockWindowData {
@@ -65,6 +69,8 @@ impl Default for MockWindowData {
             horizontal_padding: 0,
             vertical_padding: 0,
             child_role: false,
+            min_size: Size::ZERO,
+            resizes: 0,
         }
     }
 }
@@ -538,7 +544,9 @@ impl MockState {
         mw.expect_resize().returning(move |size| {
             let mut inner = s.inner.force_write();
             if let Some(w) = inner.windows.get_mut(&id) {
-                w.frame.max = w.frame.min + size;
+                // The app's minimum size wins, as on macOS.
+                w.frame.max = w.frame.min + size.max(w.min_size);
+                w.resizes += 1;
             }
         });
 

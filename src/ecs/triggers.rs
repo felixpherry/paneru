@@ -27,7 +27,7 @@ use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition,
+    ActiveWorkspaceMarker, Bounds, ClampedSize, DockPosition, Initializing, LayoutPosition,
     NativeFullscreenMarker, Position, ResizeMarker, RestoreWindowState, Scrolling,
     SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio, WindowProperties,
 };
@@ -1717,6 +1717,12 @@ pub(super) fn window_resize_verifier(
             actual_size,
         );
         bounds.0 = actual_size;
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(ClampedSize {
+                asked: expected_size,
+                got: actual_size,
+            });
+        }
 
         // we may hitting minimum width constraint on this window or this window isn't resizable.
         // if this window is a part of a column, other windows in the column might have resized(shrunk) successfully,

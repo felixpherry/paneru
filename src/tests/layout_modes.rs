@@ -15,6 +15,7 @@ use crate::ecs::state::{SavedColumn, SavedLayout, SavedStrip};
 use crate::ecs::tiling::{DEFAULT_MASTER_RATIO, Tiling};
 use crate::ecs::{ActiveWorkspaceMarker, DockPosition, FullWidthMarker, ReshuffleAroundMarker};
 use crate::events::Event;
+use crate::manager::Size;
 use crate::{assert_focused, assert_window_at, assert_window_size};
 
 use super::close_focus::open_window;
@@ -633,4 +634,34 @@ fn overview_draws_a_master_row_as_its_screen() {
                 command: Command::Overview,
             },
         ]);
+}
+
+/// Spec Edge Cases (minimum size bigger than the tile). Window 1 can't be
+/// narrower than 700, so the 512-wide right half can't hold it: it ends at
+/// the screen's right edge, over window 0, and the layout stops asking it for
+/// 512. Without the stop it is resized again on every idle step; without the
+/// clamp it sits at x 512 and runs 188 px off screen.
+#[test]
+fn a_window_too_wide_for_its_tile_stays_on_screen_and_settles() {
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, |_world, state| {
+            state.update_window(1, |window| window.min_size = Size::new(700, 0));
+        })
+        .on_iteration(2, |world, state| {
+            assert_window_at!(world, 0, 0, TOP);
+            assert_window_size!(world, 0, 512, 748);
+            assert_window_at!(world, 1, TEST_DISPLAY_WIDTH - 700, TOP);
+            assert_window_size!(world, 1, 700, 748);
+            state.update_window(1, |window| window.resizes = 0);
+        })
+        .on_iteration(4, |_world, state| {
+            state.update_window(1, |window| {
+                assert_eq!(
+                    window.resizes, 0,
+                    "a refused tile size must not be asked again"
+                );
+            });
+        })
+        .run(vec![settle(), toggle(), settle(), settle(), settle()]);
 }

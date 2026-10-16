@@ -17,9 +17,9 @@ use crate::ecs::params::Windows;
 use crate::ecs::tiling::{SplitTree, Tiling, master_tiles};
 use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, ResizeMarker, Scrolling,
-    SelectedVirtualMarker, SpawnCommandsExt,
+    ActiveWorkspaceMarker, Bounds, ClampedSize, DockPosition, EnsureVisibleMarker, Initializing,
+    LayoutPosition, ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker,
+    ResizeMarker, Scrolling, SelectedVirtualMarker, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -101,6 +101,7 @@ type WindowFrames<'w, 's> = Query<
         &'static mut Bounds,
         &'static mut LayoutPosition,
         Option<&'static ResizeMarker>,
+        Option<&'static ClampedSize>,
     ),
     (Without<LayoutStrip>, With<Window>),
 >;
@@ -1377,7 +1378,7 @@ pub(super) fn layout_strip_changed(
     let get_window_frame = |entity| {
         windows
             .get(entity)
-            .map(|(position, bounds, _, resize)| {
+            .map(|(position, bounds, _, resize, _)| {
                 let size = resize.map_or(bounds.0, |resize| resize.0);
                 IRect::from_corners(position.0, position.0 + size)
             })
@@ -1394,23 +1395,39 @@ pub(super) fn layout_strip_changed(
                     let tiled = layout_strip.is_tiled();
                     layout_strip
                         .relative_positions(viewport, &get_window_frame)
-                        .map(move |(entity, frame)| (entity, frame, tiled))
+                        .map(move |(entity, frame)| (entity, frame, tiled, viewport))
                 })
                 .ok()
         })
         .flatten()
         .collect::<Vec<_>>();
 
-    for (entity, frame, tiled) in changed {
-        if let Ok((_, mut bounds, mut layout_position, resize)) = windows.get_mut(entity) {
-            if layout_position.0 != frame.min {
-                layout_position.0 = frame.min;
+    for (entity, frame, tiled, viewport) in changed {
+        if let Ok((_, mut bounds, mut layout_position, resize, clamped)) = windows.get_mut(entity) {
+            let size = resize.map_or(bounds.0, |resize| resize.0);
+            // The OS already refused this tile size (an app's minimum size)
+            // and the window still has the size it kept: asking again only
+            // loops. It keeps its tile's corner unless that runs off screen;
+            // then it ends at the screen edge, over its neighbour.
+            let refused = tiled
+                && clamped
+                    .is_some_and(|clamped| clamped.asked == frame.size() && clamped.got == size);
+            let origin = if refused {
+                // Tiled strips sit at the viewport origin, so the strip-relative
+                // screen is (0,0)-viewport.
+                let screen = IRect::from_corners(Origin::ZERO, viewport);
+                clamp_origin_to_viewport(frame.min, size, screen)
+            } else {
+                frame.min
+            };
+            if layout_position.0 != origin {
+                layout_position.0 = origin;
             }
             if tiled {
                 // A tiled row owns its windows' sizes: steer any other size
                 // request (width keys, rules, Lua, an outside resize) back to
                 // the tile, animated.
-                if resize.map_or(bounds.0, |resize| resize.0) != frame.size() {
+                if size != frame.size() && !refused {
                     commands.resize_entity(entity, frame.size());
                 }
             } else if resize.is_none() && bounds.0 != frame.size() {
